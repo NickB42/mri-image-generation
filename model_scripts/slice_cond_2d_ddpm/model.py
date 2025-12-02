@@ -24,7 +24,7 @@ from .diffusion import GaussianDiffusion
 # Configuration
 # -------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPERIMENT_ROOT = PROJECT_ROOT / "central_2d_ddpm_base"
+EXPERIMENT_ROOT = PROJECT_ROOT / "slice_cond_2d_ddpm"
 DATASET_ROOT = (PROJECT_ROOT / "../dataset").resolve()
 
 print("Using DATASET_ROOT:", DATASET_ROOT)
