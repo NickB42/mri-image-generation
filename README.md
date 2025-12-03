@@ -1,5 +1,6 @@
 # 3D Brain MRI Generation with Diffusion Models (BraTS 2021)
-This repository contains experiments on generating 3D brain MRI volumes using diffusion models, trained on the BraTS 2021 dataset.  
+
+This repository contains experiments on generating 3D brain MRI volumes using diffusion models, trained on the BraTS 2021 dataset.
 
 ---
 
@@ -8,31 +9,53 @@ This repository contains experiments on generating 3D brain MRI volumes using di
 ```text
 .
 ├── dataset/
-├── project/
-└── try_around/
-    ├── models/
-    ├── explore_dataset.ipynb
-    └── base_model.ipynb
+├── evaluation_scripts/
+├── explorations/
+├── model_scripts/
+│   ├── model_folder/
+│   └── [...]
+├── venv/
+├── .env
+├── .gitignore
+├── .perun.ini
+├── job_submission.sh
+├── README.md
+└── requirements.txt
+
 ```
 
 - dataset/
 
     Expected location for the BraTS 2021 data (not tracked in version control)
 
-- project/
+- evaluation_scripts/
 
-    Placeholder for future experiments, refactored modules, training scripts, etc.
+    Scripts for evaluating trained models (metrics, quantitative comparisons, etc.)
 
-- try_around/
-    - models/ 
+- explorations/
 
-        Suggested place for model definitions and/or saved weights and checkpoints
-    - explore_dataset.ipynb 
+    Notebooks and scripts for data exploration, visualizations and absic experiments
 
-        Notebook for inspecting the dataset, loading MRI volumes, and visualizing slices
-    - base_model.ipynb
+- model_scripts/
+    
+    Main training / inference code for diffusion models
 
-        Notebook for prototyping a baseline diffusion model for 2D image generation
+- .env_template
+
+    Environment variable configuration
+
+- .perun.ini
+
+    Global Perun configuration for experiment tracking
+
+- job_submission.sh
+    
+    Helper script to submit jobs to the compute cluster
+
+- requirements.txt
+
+    Python dependencies
+
 
 ## Setup
 1. Clone the repository
@@ -48,7 +71,14 @@ source .venv/bin/activate      # Linux / macOS
 # .venv\Scripts\activate       # Windows
 ```
 
-3. Install dependencies
+3. Create .env
+- Copy .env_template to .env and edit values as needed
+- Necessary variables:
+    - MLFLOW_TRACKING_USERNAME=YOUR_USERNAME_HERE
+    - MLFLOW_TRACKING_PASSWORD=YOUR_PASSWORD_HERE
+    - MLFLOW_TRACKING_URI=YOUR_MLFLOW_TRACKING_URI_HERE
+
+4. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
@@ -75,3 +105,38 @@ dataset/
 ```
 
 Make sure the paths used in the notebooks (e.g. a DATASET_ROOT variable) point to this dataset/ folder.
+
+## Training
+
+### Submitting a training job (SLURM)
+
+Training is launched via the `job_submission.sh` script, which wraps `sbatch` and runs a Python module inside the project’s virtual environment.
+
+From the project root:
+
+```bash
+# Generic pattern
+sbatch job_submission.sh <module_or_path> [args...]
+
+# Train the slice-conditioned 2D DDPM (using the module path)
+sbatch job_submission.sh model_scripts.slice_cond_2d_ddpm.model
+
+# Same script, referenced via file path
+sbatch job_submission.sh model_scripts/slice_cond_2d_ddpm/model.py
+```
+
+The script will:
+
+1. Change to the submission directory ($SLURM_SUBMIT_DIR).
+
+2. Load your shell config ($HOME/.bashrc), project .env, and venv
+
+3. Run python -m <module> with any extra arguments you pass
+
+4. Save logs to 
+    model_scripts/slice_cond_2d_ddpm/logs/model/<JOB_ID>.out (for the example above)
+
+You can monitor job status with:
+```bash
+squeue -u $USER
+```
