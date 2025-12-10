@@ -26,19 +26,23 @@ from .diffusion import GaussianDiffusion
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-EXPERIMENT_NAME = "slice_cond_2d_ddpm"
+EXPERIMENT_NAME = "25d_ddpm_all_modalities"
 RUN_IDENTIFIER = os.environ.get("SLURM_JOB_ID") or str(uuid.uuid4())
 
 IMAGE_SIZE = 128
-DATASET_SUBSAMPLE_PORTION = 3
+DATASET_SUBSAMPLE_PORTION = 2
 TIMESTEPS = 1000
 PATIENCE = 4
 LEARNING_RATE = 2e-4
 MIN_DELTA = 1e-4
 BATCH_SIZE = 64
-NUM_EPOCHS = 20
+NUM_EPOCHS = 50
 
-NUM_WORKERS = 4
+CENTER_MODALITIES = 4
+SLICE_RADIUS = 2
+CONTEXT_SLICES = 2 * SLICE_RADIUS
+
+NUM_WORKERS = 2
 DEBUG_FAST = False
 SHOULD_TERMINATE = False
 
@@ -88,8 +92,13 @@ def install_signal_handlers():
 # -------------------------------------------------------------------
 # Dataset and DataLoaders
 # -------------------------------------------------------------------
-full_dataset = BraTSSliceDataset(DATASET_ROOT, image_size=IMAGE_SIZE)
+full_dataset = BraTSSliceDataset(
+    DATASET_ROOT,
+    image_size=IMAGE_SIZE,
+    slice_radius=SLICE_RADIUS,
+)
 
+full_dataset = Subset(full_dataset, list(range(len(full_dataset) // DATASET_SUBSAMPLE_PORTION)))
 full_dataset = Subset(full_dataset, list(range(len(full_dataset) // DATASET_SUBSAMPLE_PORTION)))
 
 if DEBUG_FAST:
@@ -123,13 +132,16 @@ print(f"Train slices: {len(train_dataset)}, Val slices: {len(val_dataset)}")
 # -------------------------------------------------------------------
 # Model, diffusion process, optimizer, scheduler
 # -------------------------------------------------------------------
+IN_CHANNELS = CENTER_MODALITIES + CENTER_MODALITIES * CONTEXT_SLICES
+OUT_CHANNELS = CENTER_MODALITIES
+
 model = UNet(
-    img_channels=1,
+    in_channels=IN_CHANNELS,
+    out_channels=OUT_CHANNELS,
     base_channels=64,
     channel_mults=(1, 2, 4, 8),
     time_emb_dim=256,
 )
-
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs for model training.")
     model = torch.nn.DataParallel(model)
@@ -139,7 +151,7 @@ model = model.to(device)
 diffusion = GaussianDiffusion(
     model=model,
     image_size=IMAGE_SIZE,
-    channels=1,
+    channels=OUT_CHANNELS,
     timesteps=TIMESTEPS,
 ).to(device)
 
@@ -164,25 +176,26 @@ def train_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float:
 
     start_time = time.time()
 
-    for step, (x, z_pos) in enumerate(train_loader, start=1):
+    for step, (x_center, x_context, z_pos) in enumerate(train_loader, start=1):
         # if SHOULD_TERMINATE:
         #     print(f"[train_one_epoch] Termination requested at epoch {epoch}, step {step}. Breaking.")
         #     break
 
-        x = x.to(device, non_blocking=True)          # (B, 1, H, W)
-        z_pos = z_pos.to(device).float()             # (B,)
+        x_center = x_center.to(device, non_blocking=True)    # (B, 4, H, W)
+        x_context = x_context.to(device, non_blocking=True)  # (B, 8, H, W)
+        z_pos = z_pos.to(device).float()                     # (B,)
 
         t = torch.randint(
             0,
             diffusion.timesteps,
-            (x.size(0),),
+            (x_center.size(0),),
             device=device,
         ).long()
 
         optimizer.zero_grad()
         
         with autocast("cuda", enabled=(device.type == "cuda")):
-            loss = diffusion.p_losses(x, t, z_pos)
+            loss = diffusion.p_losses(x_center, t, z_pos, context=x_context)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -220,18 +233,21 @@ def validate(epoch: int, max_steps: Union[int, None] = None) -> float:
     running_loss = 0.0
     n_steps = 0
 
-    for step, (x, z_pos) in enumerate(val_loader, start=1):
-        x = x.to(device, non_blocking=True)
+    for step, (x_center, x_context, z_pos) in enumerate(val_loader, start=1):
+        x_center = x_center.to(device, non_blocking=True)
+        x_context = x_context.to(device, non_blocking=True)
         z_pos = z_pos.to(device).float()
 
         t = torch.randint(
             0,
             diffusion.timesteps,
-            (x.size(0),),
+            (x_center.size(0),),
             device=device,
         ).long()
 
-        loss = diffusion.p_losses(x, t, z_pos)
+        with autocast("cuda", enabled=(device.type == "cuda")):
+            loss = diffusion.p_losses(x_center, t, z_pos, context=x_context)
+
         running_loss += loss.item()
         n_steps += 1
 
@@ -387,6 +403,8 @@ def main() -> None:
                 "run_identifier": RUN_IDENTIFIER,
                 "num_workers": NUM_WORKERS,
                 "dataset_subsample_portion": DATASET_SUBSAMPLE_PORTION,
+                "modalities": CENTER_MODALITIES,
+                "context_slices": CONTEXT_SLICES,
             }
         )
 

@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH --partition=normal
-#SBATCH --time=5:00:00
+#SBATCH --time=48:00:00
 #SBATCH --gres=gpu:4g.20gb:1
 #SBATCH --job-name=ddpm_2d
 #SBATCH --output=/dev/null
+#SBATCH --signal=SIGUSR1@600
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -37,7 +38,7 @@ SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SCRIPT_NAME="$(basename "$SCRIPT_PATH" .py)"
 
 # Logs: <script_dir>/logs/<script_name>/<jobid>.out
-LOG_DIR="${SCRIPT_DIR}/logs/${SCRIPT_NAME}"
+LOG_DIR="${SCRIPT_DIR}/logs/${SCRIPT_NAME}/${SLURM_JOB_ID}"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/${SLURM_JOB_ID}.out"
 
@@ -48,7 +49,6 @@ echo "Logging to: $LOG_FILE"
 echo "Module: $MODULE"
 echo "Script path (derived): $SCRIPT_PATH"
 echo
-
 
 echo "SLURM job id:  $SLURM_JOB_ID"
 echo "Node(s):       $SLURM_JOB_NODELIST"
@@ -72,4 +72,21 @@ echo "CWD: $(pwd)"
 echo "Command: python -m $MODULE $*"
 echo
 
+### GPU MONITOR: start periodic logging in background
+GPU_LOG="${LOG_DIR}/gpu_usage_${SLURM_JOB_ID}.csv"
+echo "Logging GPU usage to: $GPU_LOG"
+echo "timestamp,util.gpu,util.mem,mem.used,mem.total" > "$GPU_LOG"
+
+nvidia-smi \
+  --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total \
+  --format=csv,noheader,nounits \
+  -l 30 >> "$GPU_LOG" &
+GPU_MONITOR_PID=$!
+
+# Run training
 python -m "$MODULE" "$@"
+TRAIN_EXIT_CODE=$?
+
+kill "$GPU_MONITOR_PID" 2>/dev/null || true
+
+exit "$TRAIN_EXIT_CODE"

@@ -1,8 +1,10 @@
-from torch.utils.data import Dataset
+from collections import OrderedDict
 from pathlib import Path
+
 import nibabel as nib
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 import torch.nn.functional as F
 
 class BraTSSliceDataset(Dataset):
@@ -11,6 +13,7 @@ class BraTSSliceDataset(Dataset):
     - Finds all *flair.nii.gz files
     - Uses central 80% slices from each volume
     - Returns normalized 2D slice as tensor in [-1, 1], shape (1, H, W)
+    - Also returns normalized slice index in [0, 1]
     """
     def __init__(self, root_dir, modality_suffix="_flair.nii.gz", image_size=128):
         super().__init__()
@@ -22,7 +25,6 @@ class BraTSSliceDataset(Dataset):
         if not self.volume_paths:
             raise RuntimeError(f"No FLAIR files (*{modality_suffix}) found under {root_dir}")
 
-        # Build (path, slice_index) list without loading data
         self.slice_tuples = []
         for p in self.volume_paths:
             img = nib.load(str(p))
@@ -38,15 +40,35 @@ class BraTSSliceDataset(Dataset):
         print(f"Found {len(self.volume_paths)} volumes.")
         print(f"Built {len(self.slice_tuples)} (volume, slice) pairs.")
 
+        self._cache = OrderedDict()
+        self._cache_size = 4 
+
+    def _load_volume(self, path):
+        path = str(path)  # ensure hashable/consistent key
+        if path in self._cache:
+            # Move to end to mark as recently used
+            vol = self._cache.pop(path)
+            self._cache[path] = vol
+            return vol
+
+        img = nib.load(path)
+        vol = np.asanyarray(img.dataobj).astype(np.float32)
+
+        # Insert and evict oldest if needed
+        self._cache[path] = vol
+        if len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)  # pop least-recently used
+
+        return vol
+
     def __len__(self):
         return len(self.slice_tuples)
 
     def __getitem__(self, idx):
         path, z = self.slice_tuples[idx]
 
-        img = nib.load(str(path))
-        vol = np.asanyarray(img.dataobj)  # shape: (H, W, D)
-        slice_2d = vol[:, :, z].astype(np.float32)
+        vol = self._load_volume(path)
+        slice_2d = vol[:, :, z]
 
         # Normalize using non-zero voxels
         mask = slice_2d != 0
@@ -56,9 +78,9 @@ class BraTSSliceDataset(Dataset):
             std = std if std > 0 else 1.0
             slice_2d[mask] = (slice_2d[mask] - mean) / std
 
-        # Clip extreme values and map to [0,1]
+        # Clip to [-5, 5] and rescale to [0, 1]
         slice_2d = np.clip(slice_2d, -5, 5)
-        slice_2d = (slice_2d + 5) / 10.0  # now in [0,1]
+        slice_2d = (slice_2d + 5) / 10.0
 
         # To tensor and resize to (image_size, image_size)
         slice_t = torch.from_numpy(slice_2d).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
@@ -70,9 +92,10 @@ class BraTSSliceDataset(Dataset):
         )
         slice_t = slice_t.squeeze(0)  # (1,H,W)
 
-        # Map [0,1] -> [-1,1]
         slice_t = slice_t * 2.0 - 1.0
 
-        z_pos = np.float32(z / 154.0)
+        # z normalization:
+        D = vol.shape[-1]
+        z_pos = np.float32(z / (D - 1))
 
         return slice_t, z_pos

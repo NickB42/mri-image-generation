@@ -5,7 +5,6 @@ import torch
 
 from .unet import UNet
 from .diffusion import GaussianDiffusion
-from .model import sample_and_save
 from torchvision.utils import save_image
 
 # ------------------ device ------------------
@@ -23,6 +22,51 @@ BASE_DIR = Path(__file__).resolve().parent
 
 IMAGE_SIZE = 128
 TIMESTEPS = 800 # 800
+
+def sample_and_save(
+    diffusion,
+    epoch,
+    num_samples=16,
+    out_dir="samples",
+    context_slices=3,
+    nrow=4,
+):
+    """
+    Generate samples and save a grid image to disk.
+
+    - diffusion: your GaussianDiffusion instance
+    - epoch: current epoch (used in filename)
+    - num_samples: how many images to sample
+    - out_dir: folder where PNGs will be saved
+    - context_slices: if using 2.5D, number of slice-channels (to pick center one)
+    - nrow: number of images per row in the grid
+    """
+    diffusion.model.eval()
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with torch.no_grad():
+        # (B, C, H, W), C = channels (1 for 2D, >1 for 2.5D)
+        samples = diffusion.sample(batch_size=num_samples).cpu()
+
+    # map from [-1, 1] to [0, 1]
+    samples = samples.clamp(-1, 1)
+    samples = (samples + 1) / 2.0
+
+    # If using 2.5D (multi-slice channels), pick the center slice for visualization
+    if context_slices is not None and context_slices > 1:
+        center_idx = context_slices // 2
+        # keep center channel as 1-channel image
+        samples = samples[:, center_idx:center_idx+1, :, :]  # (B, 1, H, W)
+
+    # Build filename
+    save_path = out_dir / f"samples_epoch_{epoch:03d}.png"
+
+    # Save a grid of images
+    save_image(samples, save_path, nrow=nrow)
+
+    print(f"Saved samples to {save_path}")
 
 # ------------------ functions ------------------
 def load_best_model_and_sample(
@@ -169,11 +213,11 @@ if __name__ == "__main__":
     #   mode="2d"       → normal random samples
     #   mode="pseudo3d" → sweep z_pos and build a volume
     load_best_model_and_sample(
-        checkpoint_path=BASE_DIR / "models" / "2d_central_ddpm_flair_best_new.pt",
+        checkpoint_path=BASE_DIR / "models" / "1591447" / "2d_central_ddpm_flair_best.pt",
         # checkpoint_path=BASE_DIR / "2d_central_ddpm_flair_best.pt",
         mode="pseudo3d",     # change to "2d" if you want plain sampling
         pseudo3d_num_slices=155,
-        pseudo3d_volume_name="brain6",
+        pseudo3d_volume_name="brain7",
     )
 
 """
