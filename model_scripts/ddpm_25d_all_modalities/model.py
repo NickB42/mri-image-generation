@@ -26,7 +26,7 @@ from .diffusion import GaussianDiffusion
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-EXPERIMENT_NAME = "25d_ddpm_all_modalities"
+EXPERIMENT_NAME = "ddpm_25d_all_modalities"
 RUN_IDENTIFIER = os.environ.get("SLURM_JOB_ID") or str(uuid.uuid4())
 
 IMAGE_SIZE = 128

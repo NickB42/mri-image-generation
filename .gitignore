@@ -18,3 +18,5 @@ samples_inference/
 perun_results/
 
 perun_debug/
+
+slice_cond_2d_ddpm_builtin/

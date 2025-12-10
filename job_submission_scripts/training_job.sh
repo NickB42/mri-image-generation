@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=normal
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:4g.20gb:1
+#SBATCH --gres=gpu:4g.20gb:2
 #SBATCH --job-name=ddpm_2d
 #SBATCH --output=/dev/null
 #SBATCH --signal=SIGUSR1@600
