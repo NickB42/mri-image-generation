@@ -304,7 +304,7 @@ def generate_hybrid_volume_for_subject(
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    DATASET_ROOT = (PROJECT_ROOT / "../dataset").resolve()
+    DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
     EXPERIMENT_NAME = "ddpm_25d_all_modalities" 
     
     CHECKPOINT_PATH = (

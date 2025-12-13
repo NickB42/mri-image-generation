@@ -4,4 +4,5 @@ matplotlib
 nibabel
 mlflow
 perun
-torchvision
+torchvision 
+diffusers

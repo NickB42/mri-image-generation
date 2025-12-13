@@ -48,7 +48,7 @@ SHOULD_TERMINATE = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
-DATASET_ROOT = (PROJECT_ROOT / "../dataset").resolve()
+DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
 
 print("Using DATASET_ROOT:", DATASET_ROOT)
 

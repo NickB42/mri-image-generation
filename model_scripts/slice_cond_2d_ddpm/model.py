@@ -1,27 +1,22 @@
 from pathlib import Path
 from typing import Union, Optional
-import json, os
+import os
 from datetime import datetime
-import sys
 import uuid
-import signal
 import time
 
 import torch
 from torch.utils.data import DataLoader, random_split, Subset
 from torch.amp import autocast, GradScaler
-from torchvision.utils import save_image
 
 import mlflow
 import mlflow.pytorch
 
-import perun
-from perun.data_model.data import MetricType, DataNode
-from perun.processing import processDataNode
-
 from .dataset import BraTSSliceDataset
 from .unet import UNet
 from .diffusion import GaussianDiffusion
+from ..helpers.perun_utils import run_with_perun
+from ..helpers.signals import install_signal_handlers, should_terminate
 
 # -------------------------------------------------------------------
 # Configuration
@@ -40,11 +35,11 @@ NUM_EPOCHS = 20
 
 NUM_WORKERS = 4
 DEBUG_FAST = False
-SHOULD_TERMINATE = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
-DATASET_ROOT = (PROJECT_ROOT / "../dataset").resolve()
+DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
+PERUN_OUT_DIR = EXPERIMENT_ROOT / "perun_results" / RUN_IDENTIFIER
 
 print("Using DATASET_ROOT:", DATASET_ROOT)
 
@@ -69,22 +64,7 @@ print("CUDA_VISIBLE_DEVICES:", os.getenv("CUDA_VISIBLE_DEVICES"))
 for i in range(torch.cuda.device_count()):
     props = torch.cuda.get_device_properties(i)
     print(f"[GPU {i}] {props.name}, {props.total_memory / (1024**3):.1f} GB")
-# -------------------------------------------------------------------
-# Signal handlers for graceful shutdown
-# -------------------------------------------------------------------
-def _handle_sigusr1(signum, frame):
-    global SHOULD_TERMINATE
-    print(f"[Signal] Received SIGUSR1 ({signum}). Requested graceful shutdown.")
-    SHOULD_TERMINATE = True
 
-def _handle_sigterm(signum, frame):
-    global SHOULD_TERMINATE
-    print(f"[Signal] Received SIGTERM ({signum}). Emergency shutdown requested.")
-    SHOULD_TERMINATE = True
-
-def install_signal_handlers():
-    signal.signal(signal.SIGUSR1, _handle_sigusr1)
-    signal.signal(signal.SIGTERM, _handle_sigterm)
 # -------------------------------------------------------------------
 # Dataset and DataLoaders
 # -------------------------------------------------------------------
@@ -157,7 +137,6 @@ scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 # Training helpers
 # -------------------------------------------------------------------
 def train_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float:
-    global SHOULD_TERMINATE
     diffusion.train()
     running_loss = 0.0
     n_steps = 0
@@ -165,7 +144,7 @@ def train_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float:
     start_time = time.time()
 
     for step, (x, z_pos) in enumerate(train_loader, start=1):
-        # if SHOULD_TERMINATE:
+        # if should_terminate():
         #     print(f"[train_one_epoch] Termination requested at epoch {epoch}, step {step}. Breaking.")
         #     break
 
@@ -231,7 +210,9 @@ def validate(epoch: int, max_steps: Union[int, None] = None) -> float:
             device=device,
         ).long()
 
-        loss = diffusion.p_losses(x, t, z_pos)
+        with autocast("cuda", enabled=(device.type == "cuda")):
+            loss = diffusion.p_losses(x, t, z_pos)
+        
         running_loss += loss.item()
         n_steps += 1
 
@@ -242,75 +223,30 @@ def validate(epoch: int, max_steps: Union[int, None] = None) -> float:
     print(f"Epoch {epoch} | Val loss:   {avg_loss:.4f}")
     return avg_loss
 
-# -------------------------------------------------------------------
-# Perun ↔ MLflow bridge
-# -------------------------------------------------------------------
-def log_perun_metrics_to_mlflow(root: DataNode) -> None:
-    cfg = getattr(perun, "config", None)
-    processed_root = processDataNode(root, cfg, force_process=False) if cfg is not None else root
-
-    def find_first_metric(node: DataNode, metric_type: MetricType):
-        metrics = getattr(node, "metrics", None)
-        if metrics and metric_type in metrics:
-            return float(metrics[metric_type].value)
-
-        for child in getattr(node, "nodes", {}).values():
-            val = find_first_metric(child, metric_type)
-            if val is not None:
-                return val
-        return None
-
-    run = mlflow.active_run()
-    if run is None:
-        return
-
-    total_energy_j = find_first_metric(processed_root, MetricType.ENERGY)
-    runtime_s = find_first_metric(processed_root, MetricType.RUNTIME)
-    co2_kg = find_first_metric(processed_root, MetricType.CO2)
-    money = find_first_metric(processed_root, MetricType.MONEY)
-
-    def log_if_not_none(name: str, value):
-        if value is not None:
-            mlflow.log_metric(name, float(value))
-
-    log_if_not_none("perun_energy_joules", total_energy_j)
-    log_if_not_none("perun_runtime_seconds", runtime_s)
-    log_if_not_none("perun_co2_kg", co2_kg)
-    log_if_not_none("perun_cost", money)
-
-    if total_energy_j is not None:
-        energy_kwh = total_energy_j / 3.6e6
-        log_if_not_none("perun_energy_kwh", energy_kwh)
-
-    if total_energy_j is not None and runtime_s is not None and runtime_s > 0:
-        avg_power_w = total_energy_j / runtime_s
-        log_if_not_none("perun_avg_power_watts", avg_power_w)
 
 # -------------------------------------------------------------------
 # Main training loop
 # -------------------------------------------------------------------
 def train() -> float:
-    global SHOULD_TERMINATE
-
     print("Starting Training")
 
     best_val = float("inf")
     epochs_without_improvement = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        if SHOULD_TERMINATE:
+        if should_terminate():
             print(f"[train] Termination requested before epoch {epoch}, stopping.")
             break
 
         train_loss = train_one_epoch(epoch, max_steps=10 if DEBUG_FAST else None)
         
-        if SHOULD_TERMINATE:
+        if should_terminate():
             print(f"[train] Termination requested after epoch {epoch}, stopping before validation.")
             break
 
         val_loss = validate(epoch, max_steps=5 if DEBUG_FAST else None)
 
-        if SHOULD_TERMINATE:
+        if should_terminate():
             print(f"[train] Termination requested after epoch {epoch} validation, stopping.")
             break
 
@@ -353,20 +289,6 @@ def train() -> float:
 
     return best_val
 
-
-@perun.perun(
-    data_out=str(EXPERIMENT_ROOT / "perun_results" / RUN_IDENTIFIER),
-    format="json",
-)
-def train_with_perun():
-    try:
-        perun.register_callback(log_perun_metrics_to_mlflow)
-    except Exception as e:
-        print(f"Perun callback registration failed: {e}")
-
-    return train()
-
-
 def main() -> None:
     mlflow.set_experiment(EXPERIMENT_NAME)
 
@@ -390,7 +312,10 @@ def main() -> None:
             }
         )
 
-        best_val = train_with_perun()
+        best_val = run_with_perun(
+            train,
+            data_out=str(PERUN_OUT_DIR),
+        )
 
         mlflow.pytorch.log_model(diffusion.model, artifact_path="final_model")
 
