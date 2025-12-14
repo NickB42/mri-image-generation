@@ -1,7 +1,4 @@
-#!/usr/bin/env python3
 """
-infer_ldm_3d.py
-
 Unconditional inference for a 3D latent diffusion model trained on BraTS (4 modalities).
 - Loads VAE3D + GaussianDiffusionLatent3D(UNet3DModel)
 - Auto-detects latent spatial size by running VAE.encode_to_latent() on a dummy patch
@@ -11,16 +8,8 @@ Unconditional inference for a 3D latent diffusion model trained on BraTS (4 moda
     - raw tensor .pt
     - slice grid PNG
     - optional NIfTI .nii.gz per modality if nibabel installed
-
-Run (from your repo root, so imports work):
-  PYTHONPATH=. python infer_ldm_3d.py \
-    --vae_ckpt /path/to/vae3d_final.pt \
-    --ldm_ckpt /path/to/3d_ldm_diffusion_best.pt \
-    --outdir ./inference_out \
-    --num_samples 2
 """
 
-import argparse
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -28,13 +17,10 @@ import torch
 import matplotlib.pyplot as plt
 
 
-# -------------------------
-# EDIT THESE IMPORTS
-# -------------------------
-# Make these match your project layout.
-from your_package.vae import VAE3D
-from your_package.unet import UNet3DModel
-from your_package.diffusion import GaussianDiffusionLatent3D
+from .vae import VAE3D
+from .unet import UNet3DModel
+from .diffusion import GaussianDiffusionLatent3D
+from .dataset import BraTS3DVolumeDataset
 
 
 def pick_device(device_str: Optional[str]) -> torch.device:
@@ -91,7 +77,7 @@ def load_state_dict_safely(module: torch.nn.Module, ckpt_path: Path, device: tor
     state = _unwrap_state_dict(ckpt)
     state = _remap_ddp_keys_if_needed(state)
 
-    missing, unexpected = module.load_state_dict(state, strict=False)
+    missing, unexpected = module.load_state_dict(state, strict=True)
     if missing:
         print(f"[WARN] Missing keys loading {ckpt_path.name} (showing up to 20): {missing[:20]}")
     if unexpected:
@@ -109,24 +95,6 @@ def infer_latent_spatial_size(vae: torch.nn.Module, patch: Tuple[int, int, int],
     if z.ndim != 5:
         raise RuntimeError(f"Expected latent to be 5D (B,C,D,H,W), got shape {tuple(z.shape)}")
     return (int(z.shape[-3]), int(z.shape[-2]), int(z.shape[-1]))
-
-
-@torch.no_grad()
-def decode_latents(vae: torch.nn.Module, z: torch.Tensor) -> torch.Tensor:
-    """
-    Attempts likely decode APIs for your VAE3D.
-    Returns (B, 4, D, H, W)
-    """
-    if hasattr(vae, "decode_from_latent") and callable(getattr(vae, "decode_from_latent")):
-        return vae.decode_from_latent(z)
-    if hasattr(vae, "decode") and callable(getattr(vae, "decode")):
-        return vae.decode(z)
-    if hasattr(vae, "decoder"):
-        return vae.decoder(z)
-    raise AttributeError(
-        "Could not find a supported VAE decode method.\n"
-        "Tried: decode_from_latent(z), decode(z), vae.decoder(z)."
-    )
 
 
 def save_slice_grid_png(
@@ -199,116 +167,288 @@ def maybe_save_nifti_per_modality(vol_4ch: torch.Tensor, out_stem: Path) -> List
     return written
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--vae_ckpt", type=str, required=True)
-    ap.add_argument("--ldm_ckpt", type=str, required=True)
-    ap.add_argument("--outdir", type=str, required=True)
-    ap.add_argument("--device", type=str, default=None)
-
-    # Patch size (matches train.py defaults)
-    ap.add_argument("--patch_d", type=int, default=128)
-    ap.add_argument("--patch_h", type=int, default=160)
-    ap.add_argument("--patch_w", type=int, default=160)
-
-    # Model hyperparams (matches train.py defaults)
-    ap.add_argument("--latent_channels", type=int, default=16)
-    ap.add_argument("--vae_base_channels", type=int, default=32)
-    ap.add_argument("--vae_num_down", type=int, default=3)
-
-    ap.add_argument("--unet_base_channels", type=int, default=128)
-    ap.add_argument("--unet_channel_mults", type=str, default="1,2,4")
-
-    ap.add_argument("--timesteps", type=int, default=1000)
-    ap.add_argument("--num_samples", type=int, default=1)
-    ap.add_argument("--seed", type=int, default=0)
-
-    args = ap.parse_args()
-
-    device = pick_device(args.device)
-    print(f"[INFO] Device: {device}")
-
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
-
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    patch = (args.patch_d, args.patch_h, args.patch_w)
-    channel_mults = tuple(int(x.strip()) for x in args.unet_channel_mults.split(",") if x.strip())
-
-    # Build models
+def setup_models(device: torch.device, vae_config: Dict[str, Any], unet_config: Dict[str, Any], diffusion_config: Dict[str, Any]) -> Tuple[torch.nn.Module, torch.nn.Module]:
+    """Build and initialize VAE and diffusion models."""
     vae = VAE3D(
         in_channels=4,
-        base_channels=args.vae_base_channels,
-        num_down=args.vae_num_down,
-        latent_channels=args.latent_channels,
+        base_channels=vae_config["base_channels"],
+        num_down=vae_config["num_down"],
+        latent_channels=vae_config["latent_channels"],
     ).to(device)
 
     unet = UNet3DModel(
-        in_channels=args.latent_channels,
-        base_channels=args.unet_base_channels,
-        channel_mults=channel_mults,
+        in_channels=vae_config["latent_channels"],
+        base_channels=unet_config["base_channels"],
+        channel_mults=unet_config["channel_mults"],
     ).to(device)
 
     diffusion = GaussianDiffusionLatent3D(
         model=unet,
-        channels=args.latent_channels,
-        timesteps=args.timesteps,
+        channels=vae_config["latent_channels"],
+        timesteps=diffusion_config["timesteps"],
     ).to(device)
 
     vae.eval()
     diffusion.eval()
 
-    # Load weights
-    vae_ckpt = Path(args.vae_ckpt)
-    ldm_ckpt = Path(args.ldm_ckpt)
+    return vae, diffusion
+
+
+def load_model_weights(vae: torch.nn.Module, diffusion: torch.nn.Module, vae_ckpt: Path, ldm_ckpt: Path, device: torch.device) -> None:
+    """Load pretrained weights for VAE and diffusion models."""
     if not vae_ckpt.exists():
-        raise FileNotFoundError(vae_ckpt)
+        raise FileNotFoundError(f"VAE checkpoint not found: {vae_ckpt}")
     if not ldm_ckpt.exists():
-        raise FileNotFoundError(ldm_ckpt)
+        raise FileNotFoundError(f"LDM checkpoint not found: {ldm_ckpt}")
+
+
+    def print_weight_norms(tag, m):
+        w = next(p for p in m.parameters() if p.ndim >= 2)
+        print(f"{tag}: first weight norm = {w.detach().float().norm().item():.4f}")
 
     print(f"[INFO] Loading VAE from {vae_ckpt}")
     load_state_dict_safely(vae, vae_ckpt, device)
 
     print(f"[INFO] Loading diffusion from {ldm_ckpt}")
-    load_state_dict_safely(diffusion, ldm_ckpt, device)
+    print_weight_norms("UNet before", diffusion.model)
+    load_state_dict_safely(diffusion, Path(ldm_ckpt), device)
+    print_weight_norms("UNet after", diffusion.model)
 
-    # Infer latent spatial size from VAE
+
+def save_sample(x: torch.Tensor, out_stem: Path, sample_idx: int) -> None:
+    """Save a single sample as tensor, PNG, and optionally NIfTI."""
+    # Save tensor
+    torch.save(x, out_stem.with_suffix(".pt"))
+    print(f"[OK] Wrote {out_stem.with_suffix('.pt')}")
+
+    # Save PNG
+    png_path = out_stem.with_suffix(".png")
+    save_slice_grid_png(x, png_path, title=f"sample_{sample_idx:03d}")
+    print(f"[OK] Wrote {png_path}")
+
+    # Save NIfTI (optional)
+    niis = maybe_save_nifti_per_modality(x, out_stem)
+    if niis:
+        for p in niis:
+            print(f"[OK] Wrote {p}")
+    else:
+        print("[INFO] nibabel not installed; skipping NIfTI export.")
+
+
+def generate_samples(vae: torch.nn.Module, diffusion: torch.nn.Module, latent_spatial: Tuple[int, int, int], outdir: Path, num_samples: int) -> None:
+    """Generate and save multiple samples."""
+    for i in range(num_samples):
+        print(f"[INFO] Sampling {i+1}/{num_samples} ...")
+
+        z = diffusion.sample(batch_size=1, spatial_size=latent_spatial, cond=None)
+        x = vae.decode_from_latent(z)  # (1,4,D,H,W)
+        x = x.detach().float().cpu()[0]  # (4,D,H,W)
+
+        out_stem = outdir / f"sample_{i:03d}"
+        save_sample(x, out_stem, i)
+
+
+@torch.no_grad()
+def vae_recon_sanity(vae, loader, device, out_png):
+    vae.eval()
+    x = next(iter(loader)).to(device)              # (B,4,D,H,W)
+    recon, mu, logvar = vae(x)                     # forward() path
+    x0 = x[0].detach().float().cpu()
+    r0 = recon[0].detach().float().cpu()
+
+    # stack as 8 channels: original 4 + recon 4
+    stacked = torch.cat([x0, r0], dim=0)           # (8,D,H,W)
+    save_slice_grid_png(
+        stacked[:4], Path(str(out_png).replace(".png","_orig.png")),
+        title="orig"
+    )
+    save_slice_grid_png(
+        stacked[4:], Path(str(out_png).replace(".png","_recon.png")),
+        title="recon"
+    )
+
+@torch.no_grad()
+def latent_stats(vae, loader, device, n_batches=20):
+    vae.eval()
+    mus = []
+    stds = []
+    for i, x in enumerate(loader):
+        if i >= n_batches: break
+        x = x.to(device)
+        z = vae.encode_to_latent(x).detach().float()
+        # global stats
+        mus.append(z.mean().cpu())
+        stds.append(z.std().cpu())
+    m = torch.stack(mus).mean().item()
+    s = torch.stack(stds).mean().item()
+    print(f"latent mean ~ {m:.4f}, latent std ~ {s:.4f}")
+    return m, s
+
+@torch.no_grad()
+def run_roundtrip_and_save(diffusion, vae, loader, device, outdir, t_start=999):
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    x0, xrec = roundtrip_test(diffusion, vae, loader, device, t_start=t_start)
+    # x0, xrec are (4,D,H,W) on CPU from roundtrip_test
+
+    save_slice_grid_png(x0, outdir / f"roundtrip_t{t_start:04d}_orig.png", title=f"orig (t={t_start})")
+    save_slice_grid_png(xrec, outdir / f"roundtrip_t{t_start:04d}_recon.png", title=f"recon (t={t_start})")
+
+    # optional nifti per modality
+    maybe_save_nifti_per_modality(x0, outdir / f"roundtrip_t{t_start:04d}_orig")
+    maybe_save_nifti_per_modality(xrec, outdir / f"roundtrip_t{t_start:04d}_recon")
+
+    print("[OK] wrote roundtrip outputs to", outdir)
+
+
+@torch.no_grad()
+def roundtrip_test(diffusion, vae, loader, device, t_start=999):
+    diffusion.eval()
+    vae.eval()
+
+    x = next(iter(loader)).to(device)           # (B,4,D,H,W)
+    z0 = vae.encode_to_latent(x).float()        # (B,C,*,*,*)
+
+    t = torch.full((z0.size(0),), t_start, device=device, dtype=torch.long)
+    noise = torch.randn_like(z0)
+    zt = diffusion.q_sample(z0, t, noise=noise)
+
+    z_rec = diffusion.sample_from(zt, start_t=t_start, cond=None)
+    x_rec = vae.decode_from_latent(z_rec).float()
+
+    return x[0].cpu(), x_rec[0].cpu()
+
+@torch.no_grad()
+def eps_mse_by_t(diffusion, vae, loader, device, t_values):
+    diffusion.eval(); vae.eval()
+    x = next(iter(loader)).to(device)
+    z0 = vae.encode_to_latent(x).float()
+
+    for t0 in t_values:
+        t = torch.full((z0.size(0),), t0, device=device, dtype=torch.long)
+        noise = torch.randn_like(z0)
+        zt = diffusion.q_sample(z0, t, noise=noise)
+        eps = diffusion.model(zt, t)
+        mse = torch.mean((eps - noise) ** 2).item()
+        print(f"t={t0:4d}  eps-MSE={mse:.4f}")
+
+
+
+def main():
+    # Configuration
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    EXPERIMENT_NAME = "ddpm_3d_ldm"
+    EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
+
+    CHECKPOINT_PATH = (
+        EXPERIMENT_ROOT
+        / "models"
+        / "1593958"
+    )
+    VAE_CKPT = f"{CHECKPOINT_PATH}/vae3d_final.pt"
+    LDM_CKPT = f"{CHECKPOINT_PATH}/3d_ldm_diffusion_best.pt"
+    OUTDIR = f"{EXPERIMENT_ROOT}/samples_inference"
+    DEVICE = None  # auto-detect
+    SEED = 0
+    NUM_SAMPLES = 1
+
+    patch = (128, 160, 160)  # (D, H, W)
+
+    vae_config = {
+        "base_channels": 32,
+        "num_down": 3,
+        "latent_channels": 16,
+    }
+
+    unet_config = {
+        "base_channels": 128,
+        "channel_mults": (1, 2, 4),
+    }
+
+    diffusion_config = {
+        "timesteps": 1000,
+    }
+
+    # Setup
+    device = pick_device(DEVICE)
+    print(f"[INFO] Device: {device}")
+
+    torch.manual_seed(SEED)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(SEED)
+
+    outdir = Path(OUTDIR)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Build models
+    vae, diffusion = setup_models(device, vae_config, unet_config, diffusion_config)
+
+    # Load weights
+    load_model_weights(vae, diffusion, Path(VAE_CKPT), Path(LDM_CKPT), device)
+
+    # Infer latent spatial size
     latent_spatial = infer_latent_spatial_size(vae, patch, device)
     print(f"[INFO] Patch size:  {patch}")
     print(f"[INFO] Latent size: {latent_spatial} (detected via vae.encode_to_latent)")
 
-    # Sample + decode
-    for i in range(args.num_samples):
-        print(f"[INFO] Sampling {i+1}/{args.num_samples} ...")
+    DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
 
-        # Your diffusion.sample signature:
-        #   sample(batch_size, spatial_size, cond=None)
-        z = diffusion.sample(batch_size=1, spatial_size=latent_spatial, cond=None)
-        x = decode_latents(vae, z)  # (1,4,D,H,W)
+    dataset = BraTS3DVolumeDataset(
+        root_dir=DATASET_ROOT,
+        patch_size=patch,
+        random_crop=False,
+    )
 
-        x = x.detach().float().cpu()[0]  # (4,D,H,W)
+    vae_recon_sanity(
+        vae,
+        loader=torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=2,
+            shuffle=False,
+        ),
+        device=device,
+        out_png=outdir / "vae_recon_sanity.png"
+    )
 
-        out_stem = outdir / f"sample_{i:03d}"
+    latent_stats(
+        vae,
+        loader=torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=4,
+            shuffle=True,
+        ),
+        device=device,
+        n_batches=20
+    )
 
-        # Save tensor
-        torch.save(x, out_stem.with_suffix(".pt"))
-        print(f"[OK] Wrote {out_stem.with_suffix('.pt')}")
+    for t_start in [50, 100, 200, 400, 600, 800, 999]:
+        run_roundtrip_and_save(
+            diffusion=diffusion,
+            vae=vae,
+            loader=torch.utils.data.DataLoader(
+                dataset=dataset,
+                batch_size=2,
+                shuffle=False,
+            ),
+            device=device,
+            outdir=outdir,
+            t_start=t_start,
+        )
 
-        # Save PNG
-        png_path = out_stem.with_suffix(".png")
-        save_slice_grid_png(x, png_path, title=f"sample_{i:03d}")
-        print(f"[OK] Wrote {png_path}")
+    eps_mse_by_t(diffusion, vae,
+        loader=torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=4,
+            shuffle=True,
+        ),
+        device=device,
+        t_values=[0, 50, 100, 200, 400, 600, 800, 999]
+    )
 
-        # Save NIfTI (optional)
-        niis = maybe_save_nifti_per_modality(x, out_stem)
-        if niis:
-            for p in niis:
-                print(f"[OK] Wrote {p}")
-        else:
-            print("[INFO] nibabel not installed; skipping NIfTI export.")
+
+    # Generate samples
+    # generate_samples(vae, diffusion, latent_spatial, outdir, NUM_SAMPLES)
 
     print("[DONE] Inference complete.")
 

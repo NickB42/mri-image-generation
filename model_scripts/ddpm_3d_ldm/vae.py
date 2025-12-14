@@ -115,3 +115,14 @@ class VAE3D(nn.Module):
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z)
         return recon, mu, logvar
+
+    @torch.no_grad()
+    def encode_to_latent(self, x):
+        """Return deterministic latent mean for diffusion."""
+        mu, logvar = self.encode(x)
+        return mu
+
+    @torch.no_grad()
+    def decode_from_latent(self, z):
+        """Decode from latent space."""
+        return self.decode(z)

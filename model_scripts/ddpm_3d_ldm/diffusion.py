@@ -141,3 +141,16 @@ class GaussianDiffusionLatent3D(nn.Module):
             spatial_size = (spatial_size,) * 3
         shape = (batch_size, self.channels, *spatial_size)
         return self.p_sample_loop(shape, cond=cond)
+
+    @torch.no_grad()
+    def sample_from(self, x_t: torch.Tensor, start_t: int, cond=None) -> torch.Tensor:
+        """
+        Run the reverse process starting from a given x_t at timestep start_t.
+        start_t: int in [0, timesteps-1]
+        """
+        B = x_t.shape[0]
+        img = x_t
+        for i in reversed(range(start_t + 1)):  # inclusive down to 0
+            t = torch.full((B,), i, device=img.device, dtype=torch.long)
+            img = self.p_sample(img, t, cond)
+        return img
