@@ -36,6 +36,7 @@ class GaussianDiffusion(nn.Module):
             "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod)
         )
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
+        self.register_buffer("snr", self.alphas_cumprod / (1.0 - self.alphas_cumprod))
 
         # Posterior variance (Eq. 7 in DDPM paper)
         posterior_variance = (
@@ -86,6 +87,25 @@ class GaussianDiffusion(nn.Module):
         predicted_noise = self.model(x_noisy, t, z_pos)
 
         return F.mse_loss(predicted_noise, noise)
+
+    def p_losses(self, x_start, t, cond=None, noise=None, min_snr_gamma=5.0):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        predicted_noise = self.model(x_noisy, t) if cond is None else self.model(x_noisy, t, cond)
+
+        mse = (predicted_noise - noise) ** 2
+        mse = mse.mean(dim=(1,2,3,4))  # per-sample
+
+        snr_t = self._extract(self.snr, t, mse.shape)  # shape (B,1,1,...) but mse is (B,)
+        snr_t = snr_t.view(-1)
+
+        # min-SNR weighting
+        w = torch.minimum(snr_t, torch.tensor(min_snr_gamma, device=snr_t.device)) / snr_t
+        loss = (w * mse).mean()
+        return loss
+
 
     @torch.no_grad()
     def p_sample(self, x, t, z_pos):

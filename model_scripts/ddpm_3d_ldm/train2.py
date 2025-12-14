@@ -18,7 +18,7 @@ import mlflow.pytorch
 
 from .dataset import BraTS3DVolumeDataset
 from .vae import VAE3D
-from .unet import UNet3DModel
+from .unet_attention import UNet3DModelWithAttention
 from .diffusion import GaussianDiffusionLatent3D
 from ..helpers.perun_utils import run_with_perun
 from ..helpers.signals import install_signal_handlers, should_terminate
@@ -54,7 +54,7 @@ UNET_CHANNEL_MULTS = (1, 2, 4)
 BATCH_SIZE = 1
 NUM_WORKERS = 2
 
-DEBUG_FAST = True
+DEBUG_FAST = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
@@ -201,7 +201,7 @@ vae = VAE3D(
     latent_channels=LATENT_CHANNELS,
 ).to(device)
 
-unet = UNet3DModel(
+unet = UNet3DModelWithAttention(
     in_channels=LATENT_CHANNELS,
     base_channels=UNET_BASE_CHANNELS,
     channel_mults=UNET_CHANNEL_MULTS,
@@ -580,7 +580,7 @@ def main() -> None:
                     "min_delta": MIN_DELTA,
                     "device": str(device),
                     "model_vae": "VAE3D",
-                    "model_ldm_unet": "UNet3DModel",
+                    "model_ldm_unet": "UNet3DModelWithAttention",
                     "dataset": "BraTS_3D_4modalities",
                     "debug_fast": DEBUG_FAST,
                     "run_identifier": RUN_IDENTIFIER,

@@ -75,21 +75,24 @@ class GaussianDiffusionLatent3D(nn.Module):
         )
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def p_losses(self, x_start, t, cond=None, noise=None):
-        """
-        Loss for a given batch. Predicts the noise and uses MSE between true noise and predicted noise.
-        x_start: (B, C, D, H, W)
-        t: (B,)
-        cond: optional conditioning (ignored if model doesn't use it)
-        """
+    def p_losses(self, x_start, t, cond=None, noise=None, min_snr_gamma=5.0):
         if noise is None:
             noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        if cond is None:
-            predicted_noise = self.model(x_noisy, t)
-        else:
-            predicted_noise = self.model(x_noisy, t, cond)
-        return F.mse_loss(predicted_noise, noise)
+
+        predicted_noise = self.model(x_noisy, t) if cond is None else self.model(x_noisy, t, cond)
+
+        mse = (predicted_noise - noise) ** 2
+        mse = mse.mean(dim=(1,2,3,4))  # per-sample
+
+        snr_t = self._extract(self.snr, t, mse.shape)  # shape (B,1,1,...) but mse is (B,)
+        snr_t = snr_t.view(-1)
+
+        # min-SNR weighting
+        w = torch.minimum(snr_t, torch.tensor(min_snr_gamma, device=snr_t.device)) / snr_t
+        loss = (w * mse).mean()
+        return loss
+
 
     @torch.no_grad()
     def p_sample(self, x, t, cond=None):

@@ -1,3 +1,90 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps):
+        """
+        timesteps: (B,) int64
+        returns: (B, dim)
+        """
+        device = timesteps.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = timesteps.float()[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        if self.dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+
+class AttentionBlock3D(nn.Module):
+    def __init__(self, channels, num_heads=4, groups=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(groups, channels)
+        self.qkv = nn.Conv3d(channels, channels * 3, 1)
+        self.proj = nn.Conv3d(channels, channels, 1)
+        
+    def forward(self, x):
+        B, C, D, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=1)
+        
+        # Reshape for multi-head attention
+        q = q.reshape(B, self.num_heads, C // self.num_heads, D * H * W)
+        k = k.reshape(B, self.num_heads, C // self.num_heads, D * H * W)
+        v = v.reshape(B, self.num_heads, C // self.num_heads, D * H * W)
+        
+        # Attention
+        scale = (C // self.num_heads) ** -0.5
+        attn = torch.softmax(torch.einsum('bhcn,bhcm->bhnm', q, k) * scale, dim=-1)
+        h = torch.einsum('bhnm,bhcm->bhcn', attn, v)
+        
+        # Reshape back
+        h = h.reshape(B, C, D, H, W)
+        h = self.proj(h)
+        return x + h
+
+
+class ResidualBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim=None, groups=8):
+        super().__init__()
+        self.time_emb_dim = time_emb_dim
+        self.norm1 = nn.GroupNorm(groups, in_channels)
+        self.act1 = nn.SiLU()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, 3, padding=1)
+
+        if time_emb_dim is not None:
+            self.time_mlp = nn.Linear(time_emb_dim, out_channels)
+
+        self.norm2 = nn.GroupNorm(groups, out_channels)
+        self.act2 = nn.SiLU()
+        self.conv2 = nn.Conv3d(out_channels, out_channels, 3, padding=1)
+
+        if in_channels != out_channels:
+            self.skip = nn.Conv3d(in_channels, out_channels, 1)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x, t=None):
+        h = self.conv1(self.act1(self.norm1(x)))
+        if t is not None:
+            time_emb = self.time_mlp(t)
+            h = h + time_emb[:, :, None, None, None]
+        h = self.conv2(self.act2(self.norm2(h)))
+        return h + self.skip(x)
+
+
 class UNet3DModelWithAttention(nn.Module):
     def __init__(
         self,
