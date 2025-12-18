@@ -2,10 +2,7 @@ venv/
 .env
 .DS_Store
 
-dataset/
-!dataset/.gitkeep
-
-dataset_preprocess_flair_128/
+datasets/
 
 __pycache__/
 

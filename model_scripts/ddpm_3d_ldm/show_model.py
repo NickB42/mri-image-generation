@@ -12,13 +12,17 @@ Unconditional inference for a 3D latent diffusion model trained on BraTS (4 moda
 
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
+import math
 
 import torch
 import matplotlib.pyplot as plt
+import numpy as np
+import nibabel as nib
 
 
 from .vae import VAE3D
 from .unet import UNet3DModel
+from .unet_attention import UNet3DModelWithAttention
 from .diffusion import GaussianDiffusionLatent3D
 from .dataset import BraTS3DVolumeDataset
 
@@ -32,6 +36,8 @@ def pick_device(device_str: Optional[str]) -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+def get_unwrapped_model(m):
+    return m.module if hasattr(m, "module") else m
 
 def _unwrap_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
     """Support both raw state_dict and {"state_dict": ...} checkpoints."""
@@ -149,11 +155,6 @@ def maybe_save_nifti_per_modality(vol_4ch: torch.Tensor, out_stem: Path) -> List
     Saves each modality as NIfTI if nibabel is installed.
     Uses identity affine (good for viewing, not physical spacing).
     """
-    try:
-        import nibabel as nib
-        import numpy as np
-    except Exception:
-        return []
 
     vol = vol_4ch.numpy()  # (4,D,H,W)
     affine = np.eye(4)
@@ -176,11 +177,21 @@ def setup_models(device: torch.device, vae_config: Dict[str, Any], unet_config: 
         latent_channels=vae_config["latent_channels"],
     ).to(device)
 
-    unet = UNet3DModel(
-        in_channels=vae_config["latent_channels"],
-        base_channels=unet_config["base_channels"],
-        channel_mults=unet_config["channel_mults"],
-    ).to(device)
+    if unet_config.get("use_attention", False):
+        unet = UNet3DModelWithAttention(
+            in_channels=vae_config["latent_channels"],
+            base_channels=unet_config["base_channels"],
+            channel_mults=unet_config["channel_mults"],
+            time_emb_dim=unet_config.get("time_emb_dim", 256),
+            groups=unet_config.get("groups", 8),
+            num_heads=unet_config.get("num_heads", 4),
+        ).to(device)
+    else:
+        unet = UNet3DModel(
+            in_channels=vae_config["latent_channels"],
+            base_channels=unet_config["base_channels"],
+            channel_mults=unet_config["channel_mults"],
+        ).to(device)
 
     diffusion = GaussianDiffusionLatent3D(
         model=unet,
@@ -285,11 +296,13 @@ def latent_stats(vae, loader, device, n_batches=20):
     return m, s
 
 @torch.no_grad()
-def run_roundtrip_and_save(diffusion, vae, loader, device, outdir, t_start=999):
+def run_roundtrip_and_save(diffusion, vae, loader, device, outdir, t_start=399):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    x0, xrec = roundtrip_test(diffusion, vae, loader, device, t_start=t_start)
+    latent_scale = estimate_latent_scale(vae, loader, device, num_batches=100)
+
+    x0, xrec = roundtrip_test(diffusion, vae, loader, device, t_start=t_start, latent_scale=latent_scale)
     # x0, xrec are (4,D,H,W) on CPU from roundtrip_test
 
     save_slice_grid_png(x0, outdir / f"roundtrip_t{t_start:04d}_orig.png", title=f"orig (t={t_start})")
@@ -303,21 +316,25 @@ def run_roundtrip_and_save(diffusion, vae, loader, device, outdir, t_start=999):
 
 
 @torch.no_grad()
-def roundtrip_test(diffusion, vae, loader, device, t_start=999):
+def roundtrip_test(diffusion, vae, loader, device, t_start=399, latent_scale=1.0):
     diffusion.eval()
     vae.eval()
 
-    x = next(iter(loader)).to(device)           # (B,4,D,H,W)
-    z0 = vae.encode_to_latent(x).float()        # (B,C,*,*,*)
+    x = next(iter(loader)).to(device)                 # (B,4,D,H,W)
+    z0 = vae.encode_to_latent(x).float() * latent_scale
 
     t = torch.full((z0.size(0),), t_start, device=device, dtype=torch.long)
     noise = torch.randn_like(z0)
     zt = diffusion.q_sample(z0, t, noise=noise)
 
-    z_rec = diffusion.sample_from(zt, start_t=t_start, cond=None)
-    x_rec = vae.decode_from_latent(z_rec).float()
+    # deterministic reverse (DDIM)
+    z_rec = diffusion.sample_from_ddim(zt, start_t=t_start, cond=None)
+
+    # invert latent scaling before decode
+    x_rec = vae.decode_from_latent(z_rec / latent_scale).float()
 
     return x[0].cpu(), x_rec[0].cpu()
+
 
 @torch.no_grad()
 def eps_mse_by_t(diffusion, vae, loader, device, t_values):
@@ -333,7 +350,21 @@ def eps_mse_by_t(diffusion, vae, loader, device, t_values):
         mse = torch.mean((eps - noise) ** 2).item()
         print(f"t={t0:4d}  eps-MSE={mse:.4f}")
 
+@torch.no_grad()
+def estimate_latent_scale(vae, loader, device, num_batches=200):
+    vae.eval()
+    base_vae = get_unwrapped_model(vae)
 
+    vars_ = []
+    for i, x in enumerate(loader):
+        if i >= num_batches:
+            break
+        x = x.to(device, non_blocking=True)
+        z = base_vae.encode_to_latent(x).float()  # (B,C,d,h,w)
+        vars_.append(z.var(unbiased=False).item())
+
+    v = float(np.mean(vars_)) if len(vars_) else 1.0
+    return 1.0 / math.sqrt(max(v, 1e-8))
 
 def main():
     # Configuration
@@ -341,14 +372,16 @@ def main():
     EXPERIMENT_NAME = "ddpm_3d_ldm"
     EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
 
+    RUN_ID = "1594474"
+
     CHECKPOINT_PATH = (
         EXPERIMENT_ROOT
         / "models"
-        / "1593958"
+        / RUN_ID
     )
     VAE_CKPT = f"{CHECKPOINT_PATH}/vae3d_final.pt"
     LDM_CKPT = f"{CHECKPOINT_PATH}/3d_ldm_diffusion_best.pt"
-    OUTDIR = f"{EXPERIMENT_ROOT}/samples_inference"
+    OUTDIR = f"{EXPERIMENT_ROOT}/samples_inference/{RUN_ID}"
     DEVICE = None  # auto-detect
     SEED = 0
     NUM_SAMPLES = 1
@@ -364,10 +397,14 @@ def main():
     unet_config = {
         "base_channels": 128,
         "channel_mults": (1, 2, 4),
+        "use_attention": True,
+        "time_emb_dim": 256,
+        "groups": 8,
+        "num_heads": 4,
     }
 
     diffusion_config = {
-        "timesteps": 1000,
+        "timesteps": 400,
     }
 
     # Setup
@@ -422,7 +459,7 @@ def main():
         n_batches=20
     )
 
-    for t_start in [50, 100, 200, 400, 600, 800, 999]:
+    for t_start in [50, 100, 200, 399]:
         run_roundtrip_and_save(
             diffusion=diffusion,
             vae=vae,
@@ -443,12 +480,12 @@ def main():
             shuffle=True,
         ),
         device=device,
-        t_values=[0, 50, 100, 200, 400, 600, 800, 999]
+        t_values=[0, 50, 100, 200, 399]
     )
 
 
     # Generate samples
-    # generate_samples(vae, diffusion, latent_spatial, outdir, NUM_SAMPLES)
+    generate_samples(vae, diffusion, latent_spatial, outdir, NUM_SAMPLES)
 
     print("[DONE] Inference complete.")
 

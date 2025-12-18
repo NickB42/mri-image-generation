@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --partition=normal
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:4g.20gb:2
+#SBATCH --gres=gpu:4g.20gb:3
 #SBATCH --job-name=ddpm_3d_ldm
 #SBATCH --output=/dev/null
 #SBATCH --signal=SIGUSR1@600
+#SBATCH --cpus-per-task=8
 
 cd "$SLURM_SUBMIT_DIR"
 

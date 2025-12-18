@@ -1,0 +1,100 @@
+{
+  "ckpt": "/hkfs/home/haicore/scc/yb3349/mri/model_scripts/slice_cond_2d_ddpm/models/1591624/2d_central_ddpm_flair_best.pt",
+  "dataset_root": "/hkfs/home/haicore/scc/yb3349/mri/datasets/dataset",
+  "num_samples": 1000,
+  "fid": 91.13223266601562,
+  "kid_mean": 0.07893549650907516,
+  "kid_std": 0.002088689710944891,
+  "per_z_bin": {
+    "bin_0": {
+      "z_range": [
+        0.0,
+        0.125
+      ],
+      "fid": 194.56829833984375,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_1": {
+      "z_range": [
+        0.125,
+        0.25
+      ],
+      "fid": 161.7725372314453,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_2": {
+      "z_range": [
+        0.25,
+        0.375
+      ],
+      "fid": 132.7696075439453,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_3": {
+      "z_range": [
+        0.375,
+        0.5
+      ],
+      "fid": 108.85821533203125,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_4": {
+      "z_range": [
+        0.5,
+        0.625
+      ],
+      "fid": 89.48055267333984,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_5": {
+      "z_range": [
+        0.625,
+        0.75
+      ],
+      "fid": 83.74726104736328,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_6": {
+      "z_range": [
+        0.75,
+        0.875
+      ],
+      "fid": 132.56826782226562,
+      "kid_mean": null,
+      "kid_std": null
+    },
+    "bin_7": {
+      "z_range": [
+        0.875,
+        1.0
+      ],
+      "fid": 208.4873809814453,
+      "kid_mean": null,
+      "kid_std": null
+    }
+  },
+  "diversity": {
+    "ssim_mean": 0.8254549354314804,
+    "ssim_std": 0.03699063583468492,
+    "lpips_mean": 0.17625318095088005,
+    "lpips_std": 0.027458599317626353,
+    "pairs": 64
+  },
+  "improved_precision_recall": {
+    "enabled": false,
+    "precision": null,
+    "recall": null,
+    "k": 3,
+    "samples": null
+  },
+  "notes": {
+    "fid_kid_inputs": "FID/KID computed on float images in [0,1] (normalize=True) and repeated to 3 channels.",
+    "lpips_inputs": "LPIPS computed on images in [-1,1] (normalize=False) and repeated to 3 channels."
+  }
+}

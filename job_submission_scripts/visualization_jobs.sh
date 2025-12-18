@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=normal
-#SBATCH --time=00:30:00
+#SBATCH --time=2:30:00
 #SBATCH --gres=gpu:4g.20gb:1
 #SBATCH --job-name=ddpm_gen
 #SBATCH --output=/dev/null

@@ -1,7 +1,6 @@
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 class GaussianDiffusionLatent3D(nn.Module):
     """
@@ -13,9 +12,7 @@ class GaussianDiffusionLatent3D(nn.Module):
         self,
         model,
         channels,
-        timesteps=1000,
-        beta_start=1e-4,
-        beta_end=0.02,
+        timesteps=1000
     ):
         super().__init__()
         self.model = model
@@ -23,7 +20,7 @@ class GaussianDiffusionLatent3D(nn.Module):
         self.timesteps = timesteps
         print(f"Setting up Gaussian Diffusion (3D latent) with {timesteps} timesteps.")
 
-        betas = torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32)
+        betas = self.cosine_beta_schedule()
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = torch.cat(
@@ -39,6 +36,7 @@ class GaussianDiffusionLatent3D(nn.Module):
             "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod)
         )
         self.register_buffer("sqrt_recip_alphas", torch.sqrt(1.0 / alphas))
+        self.register_buffer("snr", self.alphas_cumprod / (1.0 - self.alphas_cumprod))
 
         posterior_variance = (
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
@@ -48,6 +46,14 @@ class GaussianDiffusionLatent3D(nn.Module):
             "posterior_log_variance_clipped",
             torch.log(torch.clamp(posterior_variance, min=1e-20)),
         )
+    
+    def cosine_beta_schedule(self, s=0.008):
+        steps = self.timesteps + 1
+        x = torch.linspace(0, self.timesteps, steps, dtype=torch.float32)
+        alphas_cumprod = torch.cos(((x / self.timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clamp(betas, 1e-8, 0.999)
 
     def _extract(self, a, t, x_shape):
         """
@@ -156,4 +162,35 @@ class GaussianDiffusionLatent3D(nn.Module):
         for i in reversed(range(start_t + 1)):  # inclusive down to 0
             t = torch.full((B,), i, device=img.device, dtype=torch.long)
             img = self.p_sample(img, t, cond)
+        return img
+    
+    @torch.no_grad()
+    def p_sample_ddim(self, x, t, t_prev, cond=None):
+        # eps prediction
+        eps = self.model(x, t) if cond is None else self.model(x, t, cond)
+
+        a_t = self._extract(self.alphas_cumprod, t, x.shape)
+        a_prev = self._extract(self.alphas_cumprod, t_prev, x.shape)
+
+        sqrt_a_t = torch.sqrt(a_t)
+        sqrt_one_minus_a_t = torch.sqrt(1.0 - a_t)
+
+        # predicted x0
+        x0 = (x - sqrt_one_minus_a_t * eps) / torch.clamp(sqrt_a_t, min=1e-8)
+
+        sqrt_a_prev = torch.sqrt(a_prev)
+        sqrt_one_minus_a_prev = torch.sqrt(1.0 - a_prev)
+
+        # deterministic DDIM (eta=0): no extra noise term
+        x_prev = sqrt_a_prev * x0 + sqrt_one_minus_a_prev * eps
+        return x_prev
+
+    @torch.no_grad()
+    def sample_from_ddim(self, x_t: torch.Tensor, start_t: int, cond=None) -> torch.Tensor:
+        B = x_t.shape[0]
+        img = x_t
+        for i in reversed(range(1, start_t + 1)):
+            t = torch.full((B,), i, device=img.device, dtype=torch.long)
+            t_prev = torch.full((B,), i - 1, device=img.device, dtype=torch.long)
+            img = self.p_sample_ddim(img, t, t_prev, cond)
         return img

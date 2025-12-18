@@ -11,6 +11,7 @@ This repository contains experiments on generating 3D brain MRI volumes using di
 ├── dataset/
 ├── evaluation_scripts/
 ├── explorations/
+├── job_submissions_scripts
 ├── model_scripts/
 │   ├── model_folder/
 │   └── [...]
@@ -18,7 +19,6 @@ This repository contains experiments on generating 3D brain MRI volumes using di
 ├── .env
 ├── .gitignore
 ├── .perun.ini
-├── job_submission.sh
 ├── README.md
 └── requirements.txt
 
@@ -35,6 +35,10 @@ This repository contains experiments on generating 3D brain MRI volumes using di
 - explorations/
 
     Notebooks and scripts for data exploration, visualizations and absic experiments
+
+- job_submissions_scripts/
+
+    Slurm batch scripts and helper utilities for submitting training/evaluation jobs to HPC clusters
 
 - model_scripts/
     

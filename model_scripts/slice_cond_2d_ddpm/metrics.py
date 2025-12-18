@@ -15,7 +15,6 @@ Assumptions:
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
@@ -27,7 +26,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-# Local imports (expects same folder)
 from .dataset import BraTSSliceDataset
 from .unet import UNet
 from .diffusion import GaussianDiffusion
@@ -126,7 +124,7 @@ def build_torchmetrics(device: torch.device):
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
         from torchmetrics.image.kid import KernelInceptionDistance
-        from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
+        from torchmetrics.image import StructuralSimilarityIndexMeasure
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
     except ImportError as e:
         raise SystemExit(
@@ -139,11 +137,11 @@ def build_torchmetrics(device: torch.device):
     # KID: subset_size must be <= number of samples seen; we’ll set later safely.
     kid = KernelInceptionDistance(feature=2048, subsets=50, subset_size=500, normalize=True).to(device)
 
-    ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     # LPIPS default normalize=False => expects [-1,1]
     lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=False).to(device)
 
-    return fid, kid, ms_ssim, lpips
+    return fid, kid, ssim, lpips
 
 
 def pr_features_resnet18(x01_3ch: torch.Tensor) -> torch.Tensor:
@@ -243,19 +241,19 @@ def main() -> None:
     image_size = 128
     timesteps = None  # If None, inferred from checkpoint betas length
     batch_size = 16
-    num_workers = 4
-    num_samples = 2000  # How many real samples to compare (and how many generated)
+    num_workers = 0
+    num_samples = 1000  # How many real samples to compare (and how many generated)
     test_frac = 0.15  # Volume-level test split fraction
     seed = 42
     device_str = None
     
     z_bins = 8
-    diversity_pairs = 128  # How many (gen1,gen2) pairs for MS-SSIM/LPIPS
+    diversity_pairs = 64  # How many (gen1,gen2) pairs for MS-SSIM/LPIPS
     save_samples = False
     out_dir_path = "./eval_out"
     
     compute_pr = False  # Compute improved precision/recall (slower)
-    pr_samples = 1000  # How many samples for PR (real & fake). Keep <= 2000 for speed
+    pr_samples = 500  # How many samples for PR (real & fake). Keep <= 2000 for speed
     
     # Create simple namespace object to hold args
     class Args:
@@ -328,7 +326,7 @@ def main() -> None:
     )
 
     # Metrics
-    fid, kid, ms_ssim, lpips = build_torchmetrics(device)
+    fid, kid, ssim, lpips = build_torchmetrics(device)
 
     # Per-z-bin metrics
     z_bins = int(args.z_bins)
@@ -419,7 +417,7 @@ def main() -> None:
         }
 
     # Diversity: generate (gen1, gen2) pairs at random z positions
-    ms_ssim_vals: List[float] = []
+    ssim_vals: List[float] = []
     lpips_vals: List[float] = []
     pairs_done = 0
 
@@ -435,8 +433,8 @@ def main() -> None:
         g2_01 = to_01(g2)
 
         # MS-SSIM in [0,1], provide data_range=1.0
-        ms = ms_ssim(to_3ch(g1_01), to_3ch(g2_01))
-        ms_ssim_vals.append(float(ms.detach().cpu().item()))
+        s = ssim(to_3ch(g1_01), to_3ch(g2_01))
+        ssim_vals.append(float(s.detach().cpu().item()))
 
         # LPIPS expects (N,3,H,W), default normalize=False => [-1,1]
         lp = lpips(to_3ch(g1), to_3ch(g2))
@@ -495,8 +493,8 @@ def main() -> None:
         "kid_std": kid_std,
         "per_z_bin": per_bin,
         "diversity": {
-            "ms_ssim_mean": safe_mean(ms_ssim_vals),
-            "ms_ssim_std": safe_std(ms_ssim_vals),
+            "ssim_mean": safe_mean(ssim_vals),
+            "ssim_std": safe_std(ssim_vals),
             "lpips_mean": safe_mean(lpips_vals),
             "lpips_std": safe_std(lpips_vals),
             "pairs": int(args.diversity_pairs),

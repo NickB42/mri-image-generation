@@ -3,9 +3,13 @@ from typing import Union, Optional
 import os
 import uuid
 import time
+import random
+import math
+
+import numpy as np
 
 import torch
-from torch.utils.data import DataLoader, random_split, Subset
+from torch.utils.data import DataLoader, Subset
 from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
 
@@ -18,7 +22,7 @@ import mlflow.pytorch
 
 from .dataset import BraTS3DVolumeDataset
 from .vae import VAE3D
-from .unet import UNet3DModel
+from .unet_attention import UNet3DModelWithAttention
 from .diffusion import GaussianDiffusionLatent3D
 from ..helpers.perun_utils import run_with_perun
 from ..helpers.signals import install_signal_handlers, should_terminate
@@ -31,7 +35,6 @@ RUN_IDENTIFIER = os.environ.get("SLURM_JOB_ID") or str(uuid.uuid4())
 
 # 3D patch size (D, H, W)
 PATCH_SIZE = (128, 160, 160)
-DATASET_SUBSAMPLE_PORTION = 2
 TIMESTEPS = 400
 
 # VAE hyperparams
@@ -41,6 +44,7 @@ VAE_BASE_CHANNELS = 32
 VAE_NUM_DOWN = 3
 LATENT_CHANNELS = 16
 VAE_KL_WEIGHT = 1e-4
+LATENT_SCALE = 1.0
 
 # LDM hyperparams
 LDM_NUM_EPOCHS = 60
@@ -52,20 +56,20 @@ UNET_BASE_CHANNELS = 128
 UNET_CHANNEL_MULTS = (1, 2, 4)
 
 BATCH_SIZE = 1
-NUM_WORKERS = 2
+NUM_WORKERS = 8
 
 DEBUG_FAST = True
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
-DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
+DATASET_ROOT = (PROJECT_ROOT / "../datasets").resolve()
+TRAIN_SET_ROOT = DATASET_ROOT / "train"
+VAL_SET_ROOT = DATASET_ROOT / "val"
 PERUN_OUT_DIR = EXPERIMENT_ROOT / "perun_results" / RUN_IDENTIFIER
-
-print("Using DATASET_ROOT:", DATASET_ROOT)
+MODELS_DIR = EXPERIMENT_ROOT / "models" / RUN_IDENTIFIER
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
-
 # -------------------------------------------------------------------
 # Device setup
 # -------------------------------------------------------------------
@@ -116,11 +120,9 @@ if IS_MAIN_PROCESS and torch.cuda.is_available():
 def get_unwrapped_model(m):
     return m.module if hasattr(m, "module") else m
 
-
 def cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
-
 
 def ddp_broadcast_bool(flag: bool) -> bool:
     if not IS_DISTRIBUTED:
@@ -129,34 +131,40 @@ def ddp_broadcast_bool(flag: bool) -> bool:
     dist.broadcast(t, src=0)
     return bool(t.item())
 
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def ddp_reduce_mean(sum_loss: float, count: int) -> float:
+    if not IS_DISTRIBUTED:
+        return sum_loss / max(1, count)
+    t = torch.tensor([sum_loss, count], device=device, dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return (t[0] / t[1]).item()
 # -------------------------------------------------------------------
 # Dataset and DataLoaders
 # -------------------------------------------------------------------
-full_dataset = BraTS3DVolumeDataset(
-    DATASET_ROOT,
+train_dataset = BraTS3DVolumeDataset(
+    TRAIN_SET_ROOT,
     patch_size=PATCH_SIZE,
     random_crop=True,
 )
 
-if DATASET_SUBSAMPLE_PORTION > 1:
-    full_dataset = Subset(
-        full_dataset,
-        list(range(len(full_dataset) // DATASET_SUBSAMPLE_PORTION))
-    )
+val_dataset = BraTS3DVolumeDataset(
+    VAL_SET_ROOT,
+    patch_size=PATCH_SIZE,
+    random_crop=False,
+)
 
 if DEBUG_FAST:
-    indices = list(range(min(16, len(full_dataset))))
-    full_dataset = Subset(full_dataset, indices)
-
-train_size = int(0.9 * len(full_dataset))
-val_size = len(full_dataset) - train_size
-split_generator = torch.Generator().manual_seed(42)
-
-train_dataset, val_dataset = random_split(
-    full_dataset,
-    [train_size, val_size],
-    generator=split_generator,
-)
+    train_dataset = Subset(train_dataset, list(range(min(20, len(train_dataset)))))
+    val_dataset = Subset(val_dataset, list(range(min(10, len(val_dataset)))))
+    if IS_MAIN_PROCESS:
+        print(
+            f"[DEBUG FAST] Using reduced datasets: "
+            f"train size {len(train_dataset)}, val size {len(val_dataset)}"
+        )
 
 if IS_DISTRIBUTED and device.type == "cuda":
     train_sampler = DistributedSampler(
@@ -165,32 +173,45 @@ if IS_DISTRIBUTED and device.type == "cuda":
         rank=rank,
         shuffle=True,
     )
-    val_sampler = None
 else:
     train_sampler = None
-    val_sampler = None
 
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
     shuffle=(train_sampler is None),
     sampler=train_sampler,
+    worker_init_fn=seed_worker,
     num_workers=NUM_WORKERS,
     pin_memory=True,
 )
 
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    sampler=val_sampler,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-)
+if IS_DISTRIBUTED and device.type == "cuda":
+    if rank == 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            sampler=None,
+            worker_init_fn=seed_worker,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
+    else:
+        val_loader = None
+else:
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        sampler=None,
+        worker_init_fn=seed_worker,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
 
 if IS_MAIN_PROCESS:
     print(f"Train volumes: {len(train_dataset)}, Val volumes: {len(val_dataset)}")
-
 # -------------------------------------------------------------------
 # Models: VAE + UNet + Diffusion
 # -------------------------------------------------------------------
@@ -201,7 +222,7 @@ vae = VAE3D(
     latent_channels=LATENT_CHANNELS,
 ).to(device)
 
-unet = UNet3DModel(
+unet = UNet3DModelWithAttention(
     in_channels=LATENT_CHANNELS,
     base_channels=UNET_BASE_CHANNELS,
     channel_mults=UNET_CHANNEL_MULTS,
@@ -238,6 +259,8 @@ def train_vae_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
     vae.train()
     running_loss = 0.0
     n_steps = 0
+    count = 0
+
     start_time = time.time()
 
     for step, x in enumerate(train_loader, start=1):
@@ -262,19 +285,21 @@ def train_vae_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
         if torch.cuda.is_available() and step == 1:
             peak = torch.cuda.max_memory_allocated() / 1024**3
             print(f"[VAE] Peak GPU memory after first step: {peak:.2f} GB")
-
-        running_loss += loss.item()
+        
+        b = x.size(0)
+        count += b
+        running_loss += loss.item() * b
         n_steps += 1
 
         if step % 100 == 0:
-            avg = running_loss / n_steps
+            avg = running_loss / count
             print(f"[VAE epoch {epoch} | step {step}] avg loss: {avg:.4f}")
 
         if max_steps is not None and step >= max_steps:
             break
 
     elapsed = time.time() - start_time
-    avg_loss = running_loss / max(1, n_steps)
+    avg_loss = ddp_reduce_mean(running_loss, count)
     steps_per_s = n_steps / max(elapsed, 1e-8)
 
     if IS_MAIN_PROCESS:
@@ -287,6 +312,7 @@ def train_vae_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
     if run is not None:
         mlflow.log_metric("vae_train_steps_per_s", steps_per_s, step=epoch)
         mlflow.log_metric("vae_train_num_steps", n_steps, step=epoch)
+        mlflow.log_metric("vae_epoch_time_s", elapsed, step=epoch)
 
     return avg_loss
 
@@ -296,6 +322,7 @@ def validate_vae(epoch: int, max_steps: Union[int, None] = None) -> float:
     vae.eval()
     running_loss = 0.0
     n_steps = 0
+    count = 0
 
     for step, x in enumerate(val_loader, start=1):
         x = x.to(device, non_blocking=True)
@@ -306,19 +333,35 @@ def validate_vae(epoch: int, max_steps: Union[int, None] = None) -> float:
             kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
             loss = recon_loss + VAE_KL_WEIGHT * kl
 
-        running_loss += loss.item()
+        running_loss += loss.item() * x.size(0)
+        count += x.size(0)
         n_steps += 1
 
         if max_steps is not None and step >= max_steps:
             break
 
-    avg_loss = running_loss / max(1, n_steps)
+    avg_loss = running_loss / max(1, count)
 
     if IS_MAIN_PROCESS:
         print(f"VAE Epoch {epoch} | Val loss: {avg_loss:.4f}")
 
     return avg_loss
 
+@torch.no_grad()
+def estimate_latent_scale(vae, loader, device, num_batches=200):
+    vae.eval()
+    base_vae = get_unwrapped_model(vae)
+
+    vars_ = []
+    for i, x in enumerate(loader):
+        if i >= num_batches:
+            break
+        x = x.to(device, non_blocking=True)
+        z = base_vae.encode_to_latent(x).float()  # (B,C,d,h,w)
+        vars_.append(z.var(unbiased=False).item())
+
+    v = float(np.mean(vars_)) if len(vars_) else 1.0
+    return 1.0 / math.sqrt(max(v, 1e-8))
 # -------------------------------------------------------------------
 # LDM Training helpers (latent diffusion)
 # -------------------------------------------------------------------
@@ -329,6 +372,7 @@ def train_ldm_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
 
     running_loss = 0.0
     n_steps = 0
+    count = 0
     start_time = time.time()
 
     for step, x in enumerate(train_loader, start=1):
@@ -341,13 +385,10 @@ def train_ldm_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
         # Get latents (mean of posterior) without grad
         with torch.no_grad():
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                z = base_vae.encode_to_latent(x)
+                z = base_vae.encode_to_latent(x).float() * LATENT_SCALE
 
         b = z.size(0)
-        
-        u = torch.rand((b,), device=device)
-        t = (u * u * (diffusion.timesteps - 1)).long()  # squares bias toward 0
-        t = (diffusion.timesteps - 1) - t               # flip -> bias toward high t
+        t = torch.randint(1, diffusion.timesteps, (b,), device=device)
 
         optimizer_ldm.zero_grad()
 
@@ -362,18 +403,19 @@ def train_ldm_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
             peak = torch.cuda.max_memory_allocated() / 1024**3
             print(f"[LDM] Peak GPU memory after first step: {peak:.2f} GB")
 
-        running_loss += loss.item()
+        running_loss += loss.item() * b
+        count += b
         n_steps += 1
 
         if IS_MAIN_PROCESS and step % 100 == 0:
-            avg = running_loss / n_steps
+            avg = running_loss / count
             print(f"[LDM epoch {epoch} | step {step}] avg loss: {avg:.4f}")
 
         if max_steps is not None and step >= max_steps:
             break
 
     elapsed = time.time() - start_time
-    avg_loss = running_loss / max(1, n_steps)
+    avg_loss = ddp_reduce_mean(running_loss, count)
     steps_per_s = n_steps / max(elapsed, 1e-8)
 
     if IS_MAIN_PROCESS:
@@ -386,6 +428,7 @@ def train_ldm_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float
     if run is not None:
         mlflow.log_metric("ldm_train_steps_per_s", steps_per_s, step=epoch)
         mlflow.log_metric("ldm_train_num_steps", n_steps, step=epoch)
+        mlflow.log_metric("ldm_epoch_time_s", elapsed, step=epoch)
 
     return avg_loss
 
@@ -398,30 +441,33 @@ def validate_ldm(epoch: int, max_steps: Union[int, None] = None) -> float:
 
     running_loss = 0.0
     n_steps = 0
+    count = 0
+
+    fixed_ts = torch.linspace(
+            1, diffusion.timesteps - 1, steps=8, device=device
+        ).long()
 
     for step, x in enumerate(val_loader, start=1):
         x = x.to(device, non_blocking=True)
 
         with torch.no_grad():
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                z = base_vae.encode_to_latent(x)
+                z = base_vae.encode_to_latent(x).float() * LATENT_SCALE
 
         b = z.size(0)
-        u = torch.rand((b,), device=device)
-        t = (u * u * (diffusion.timesteps - 1)).long()  # squares bias toward 0
-        t = (diffusion.timesteps - 1) - t               # flip -> bias toward high t
-
+        t = fixed_ts[(step - 1) % len(fixed_ts)].expand(b)
 
         with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             loss = diffusion.p_losses(z, t, cond=None, min_snr_gamma=5.0)
 
-        running_loss += loss.item()
+        running_loss += loss.item() * x.size(0)
+        count += x.size(0)
         n_steps += 1
 
         if max_steps is not None and step >= max_steps:
             break
 
-    avg_loss = running_loss / max(1, n_steps)
+    avg_loss = running_loss / max(1, count)
 
     if IS_MAIN_PROCESS:
         print(f"LDM Epoch {epoch} | Val loss: {avg_loss:.4f}")
@@ -432,10 +478,10 @@ def validate_ldm(epoch: int, max_steps: Union[int, None] = None) -> float:
 # Main training loop: VAE then LDM
 # -------------------------------------------------------------------
 def train() -> float:
-    print("Starting 3D VAE + LDM Training")
-
+    if IS_MAIN_PROCESS:
+        print("Starting 3D VAE + LDM Training")
+        print("=== Stage 1: Training 3D VAE ===")
     # ------------------ Stage 1: VAE training ------------------
-    print("=== Stage 1: Training 3D VAE ===")
 
     for epoch in range(1, VAE_NUM_EPOCHS + 1):
         if torch.cuda.is_available():
@@ -454,7 +500,16 @@ def train() -> float:
             print(f"[train] Termination requested after VAE epoch {epoch}, stopping.")
             break
 
-        val_loss = validate_vae(epoch, max_steps=2 if DEBUG_FAST else None)
+        if IS_DISTRIBUTED:
+            dist.barrier()
+
+        val_loss = validate_vae(epoch, max_steps=2 if DEBUG_FAST else None) if (val_loader is not None) else 0.0
+
+        if IS_DISTRIBUTED:
+            t = torch.tensor([val_loss], device=device, dtype=torch.float32)
+            dist.broadcast(t, src=0)
+            val_loss = float(t.item())
+            dist.barrier()
 
         if IS_MAIN_PROCESS:
             mlflow.log_metric("vae_train_loss", train_loss, step=epoch)
@@ -462,10 +517,9 @@ def train() -> float:
             mlflow.log_metric("vae_learning_rate", optimizer_vae.param_groups[0]["lr"], step=epoch)
 
         # Save VAE weights
-        models_dir = EXPERIMENT_ROOT / "models" / RUN_IDENTIFIER
-        models_dir.mkdir(parents=True, exist_ok=True)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-        vae_path = models_dir / "vae3d_final.pt"
+        vae_path = MODELS_DIR / "vae3d_final.pt"
 
         if IS_MAIN_PROCESS:
             vae_to_save = get_unwrapped_model(vae)
@@ -477,8 +531,26 @@ def train() -> float:
         p.requires_grad = False
     vae.eval()
 
+    if IS_MAIN_PROCESS:
+        print("=== Stage 2: Training 3D latent diffusion (LDM) ===")
     # ------------------ Stage 2: LDM training ------------------
-    print("=== Stage 2: Training 3D latent diffusion (LDM) ===")
+    global LATENT_SCALE
+
+    # Estimate latent scale
+    if IS_MAIN_PROCESS:
+        LATENT_SCALE = estimate_latent_scale(
+            vae, train_loader, device,
+            num_batches=20 if DEBUG_FAST else 200
+        )
+        print(f"[latent] LATENT_SCALE={LATENT_SCALE:.6f}")
+        run = mlflow.active_run()
+        if run is not None:
+            mlflow.log_param("latent_scale", LATENT_SCALE)
+
+    if IS_DISTRIBUTED:
+        tscale = torch.tensor([LATENT_SCALE], device=device, dtype=torch.float32)
+        dist.broadcast(tscale, src=0)
+        LATENT_SCALE = float(tscale.item())
 
     best_val = float("inf")
     epochs_without_improvement = 0
@@ -501,7 +573,16 @@ def train() -> float:
             print(f"[train] Termination requested after LDM epoch {epoch}, stopping before validation.")
             break
 
-        val_loss = validate_ldm(epoch, max_steps=2 if DEBUG_FAST else None)
+        if IS_DISTRIBUTED:
+            dist.barrier()
+
+        val_loss = validate_ldm(epoch, max_steps=2 if DEBUG_FAST else None) if (val_loader is not None) else 0.0
+
+        if IS_DISTRIBUTED:
+            t = torch.tensor([val_loss], device=device, dtype=torch.float32)
+            dist.broadcast(t, src=0)
+            val_loss = float(t.item())
+            dist.barrier()
 
         if should_terminate():
             print(f"[train] Termination requested after LDM epoch {epoch} validation, stopping.")
@@ -522,8 +603,8 @@ def train() -> float:
             epochs_without_improvement = 0
 
             if IS_MAIN_PROCESS:
-                best_ldm_path = models_dir / "3d_ldm_diffusion_best.pt"
-                diff_to_save = diffusion
+                best_ldm_path = MODELS_DIR / "3d_ldm_diffusion_best.pt"
+                diff_to_save = get_unwrapped_model(diffusion.model)
                 torch.save(diff_to_save.state_dict(), str(best_ldm_path))
                 mlflow.log_artifact(str(best_ldm_path), artifact_path="checkpoints")
 
@@ -580,12 +661,11 @@ def main() -> None:
                     "min_delta": MIN_DELTA,
                     "device": str(device),
                     "model_vae": "VAE3D",
-                    "model_ldm_unet": "UNet3DModel",
+                    "model_ldm_unet": "UNet3DModelWithAttention",
                     "dataset": "BraTS_3D_4modalities",
                     "debug_fast": DEBUG_FAST,
                     "run_identifier": RUN_IDENTIFIER,
                     "num_workers": NUM_WORKERS,
-                    "dataset_subsample_portion": DATASET_SUBSAMPLE_PORTION,
                     "vae_base_channels": VAE_BASE_CHANNELS,
                     "vae_num_down": VAE_NUM_DOWN,
                     "latent_channels": LATENT_CHANNELS,
