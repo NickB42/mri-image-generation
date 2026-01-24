@@ -21,7 +21,7 @@ print(f"Using device: {device}")
 BASE_DIR = Path(__file__).resolve().parent
 
 IMAGE_SIZE = 128
-TIMESTEPS = 800 # 800
+TIMESTEPS = 1000 # 800
 
 def sample_and_save(
     diffusion,
@@ -213,15 +213,17 @@ if __name__ == "__main__":
     #   mode="2d"       → normal random samples
     #   mode="pseudo3d" → sweep z_pos and build a volume
     load_best_model_and_sample(
-        checkpoint_path=BASE_DIR / "models" / "1591447" / "2d_central_ddpm_flair_best.pt",
+        checkpoint_path=BASE_DIR / "models" / "1591624" / "2d_central_ddpm_flair_best.pt",
         # checkpoint_path=BASE_DIR / "2d_central_ddpm_flair_best.pt",
         mode="pseudo3d",     # change to "2d" if you want plain sampling
         pseudo3d_num_slices=155,
-        pseudo3d_volume_name="brain7",
+        pseudo3d_volume_name="brain8",
     )
 
 """
 brain 4  -> 2d_central_ddpm_flair_best.pt
 brain 5  -> 2d_central_ddpm_flair_best_new.pt
 brain 6  -> 2d_central_ddpm_flair_best_new.pt neue variante
+brain 7  -> 2d_central_ddpm_flair_best_new.pt 1591447
+brain 8  -> 2d_central_ddpm_flair_best_new.pt 1591624
 """

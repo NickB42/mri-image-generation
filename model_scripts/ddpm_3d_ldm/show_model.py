@@ -222,7 +222,10 @@ def load_model_weights(vae: torch.nn.Module, diffusion: torch.nn.Module, vae_ckp
 
     print(f"[INFO] Loading diffusion from {ldm_ckpt}")
     print_weight_norms("UNet before", diffusion.model)
-    load_state_dict_safely(diffusion, Path(ldm_ckpt), device)
+    diff_core = get_unwrapped_model(diffusion)
+    unet_core = get_unwrapped_model(diff_core.model)
+
+    load_state_dict_safely(unet_core, Path(ldm_ckpt), device)
     print_weight_norms("UNet after", diffusion.model)
 
 
@@ -257,6 +260,52 @@ def generate_samples(vae: torch.nn.Module, diffusion: torch.nn.Module, latent_sp
 
         out_stem = outdir / f"sample_{i:03d}"
         save_sample(x, out_stem, i)
+
+@torch.no_grad()
+def generate_samples2(
+    vae: torch.nn.Module,
+    diffusion: torch.nn.Module,
+    latent_spatial: Tuple[int, int, int],
+    outdir: Path,
+    num_samples: int,
+    latent_scale: float = 1.0,          # <-- add this
+    use_ddim: bool = True,              # <-- add this
+) -> None:
+    """Generate and save multiple samples."""
+    device = next(diffusion.parameters()).device
+
+    # infer latent channels from diffusion (or pass it in)
+    # Your diffusion was constructed with channels=vae_config["latent_channels"]
+    latent_channels = diffusion.channels if hasattr(diffusion, "channels") else None
+    if latent_channels is None:
+        # fallback: look at UNet input channels if you expose it
+        latent_channels = diffusion.model.in_channels
+
+    T = diffusion.timesteps - 1 if hasattr(diffusion, "timesteps") else 399
+
+    for i in range(num_samples):
+        print(f"[INFO] Sampling {i+1}/{num_samples} ...")
+
+        if use_ddim:
+            # Start from pure Gaussian noise at timestep T
+            zT = torch.randn(
+                (1, latent_channels, latent_spatial[0], latent_spatial[1], latent_spatial[2]),
+                device=device,
+                dtype=torch.float32,
+            )
+            z = diffusion.sample_from_ddim(zT, start_t=T, cond=None)  # z0 in *training latent space*
+        else:
+            z = diffusion.sample(batch_size=1, spatial_size=latent_spatial, cond=None)
+
+        # IMPORTANT: invert latent scaling BEFORE decode (if you trained diffusion on scaled latents)
+        z_decode = z / float(latent_scale)
+
+        x = vae.decode_from_latent(z_decode)   # (1,4,D,H,W)
+        x = x.detach().float().cpu()[0]        # (4,D,H,W)
+
+        out_stem = outdir / f"sample_{i:03d}"
+        save_sample(x, out_stem, i)
+
 
 
 @torch.no_grad()
@@ -372,7 +421,7 @@ def main():
     EXPERIMENT_NAME = "ddpm_3d_ldm"
     EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
 
-    RUN_ID = "1594474"
+    RUN_ID = "1595833"
 
     CHECKPOINT_PATH = (
         EXPERIMENT_ROOT
@@ -384,7 +433,7 @@ def main():
     OUTDIR = f"{EXPERIMENT_ROOT}/samples_inference/{RUN_ID}"
     DEVICE = None  # auto-detect
     SEED = 0
-    NUM_SAMPLES = 1
+    NUM_SAMPLES = 3
 
     patch = (128, 160, 160)  # (D, H, W)
 
@@ -429,7 +478,7 @@ def main():
     print(f"[INFO] Patch size:  {patch}")
     print(f"[INFO] Latent size: {latent_spatial} (detected via vae.encode_to_latent)")
 
-    DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
+    DATASET_ROOT = (PROJECT_ROOT / "../datasets/test").resolve()
 
     dataset = BraTS3DVolumeDataset(
         root_dir=DATASET_ROOT,
@@ -437,18 +486,53 @@ def main():
         random_crop=False,
     )
 
-    vae_recon_sanity(
-        vae,
-        loader=torch.utils.data.DataLoader(
-            dataset=dataset,
-            batch_size=2,
-            shuffle=False,
-        ),
-        device=device,
-        out_png=outdir / "vae_recon_sanity.png"
-    )
+    # vae_recon_sanity(
+    #     vae,
+    #     loader=torch.utils.data.DataLoader(
+    #         dataset=dataset,
+    #         batch_size=2,
+    #         shuffle=False,
+    #     ),
+    #     device=device,
+    #     out_png=outdir / "vae_recon_sanity.png"
+    # )
 
-    latent_stats(
+    # latent_stats(
+    #     vae,
+    #     loader=torch.utils.data.DataLoader(
+    #         dataset=dataset,
+    #         batch_size=4,
+    #         shuffle=True,
+    #     ),
+    #     device=device,
+    #     n_batches=20
+    # )
+
+    # for t_start in [50, 100, 200, 399]:
+    #     run_roundtrip_and_save(
+    #         diffusion=diffusion,
+    #         vae=vae,
+    #         loader=torch.utils.data.DataLoader(
+    #             dataset=dataset,
+    #             batch_size=2,
+    #             shuffle=False,
+    #         ),
+    #         device=device,
+    #         outdir=outdir,
+    #         t_start=t_start,
+    #     )
+
+    # eps_mse_by_t(diffusion, vae,
+    #     loader=torch.utils.data.DataLoader(
+    #         dataset=dataset,
+    #         batch_size=4,
+    #         shuffle=True,
+    #     ),
+    #     device=device,
+    #     t_values=[0, 50, 100, 200, 399]
+    # )
+
+    spatial2 = estimate_latent_scale(
         vae,
         loader=torch.utils.data.DataLoader(
             dataset=dataset,
@@ -456,36 +540,22 @@ def main():
             shuffle=True,
         ),
         device=device,
-        n_batches=20
+        num_batches=200
     )
-
-    for t_start in [50, 100, 200, 399]:
-        run_roundtrip_and_save(
-            diffusion=diffusion,
-            vae=vae,
-            loader=torch.utils.data.DataLoader(
-                dataset=dataset,
-                batch_size=2,
-                shuffle=False,
-            ),
-            device=device,
-            outdir=outdir,
-            t_start=t_start,
-        )
-
-    eps_mse_by_t(diffusion, vae,
-        loader=torch.utils.data.DataLoader(
-            dataset=dataset,
-            batch_size=4,
-            shuffle=True,
-        ),
-        device=device,
-        t_values=[0, 50, 100, 200, 399]
-    )
-
+    print(spatial2, latent_spatial)
 
     # Generate samples
-    generate_samples(vae, diffusion, latent_spatial, outdir, NUM_SAMPLES)
+    # generate_samples(vae, diffusion, latent_spatial, outdir, NUM_SAMPLES)
+
+    generate_samples2(
+        vae=vae,
+        diffusion=diffusion,
+        latent_spatial=latent_spatial,
+        outdir=outdir,
+        num_samples=NUM_SAMPLES,
+        latent_scale=spatial2,
+        use_ddim=True,
+    )
 
     print("[DONE] Inference complete.")
 

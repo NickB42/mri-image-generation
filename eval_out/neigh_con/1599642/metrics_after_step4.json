@@ -1,0 +1,123 @@
+{
+  "config": {
+    "BRATS_ROOT": "/hkfs/home/haicore/scc/yb3349/mri/datasets/test",
+    "CHECKPOINT": "/hkfs/home/haicore/scc/yb3349/mri/model_scripts/ddpm_25d_all_modalities/models/1591706/25d_ddpm_all_modalities_best.pt",
+    "OUT_DIR": "./eval_out/neigh_con/1599642",
+    "IMAGE_SIZE": 128,
+    "TIMESTEPS": 1000,
+    "CENTER_MODALITIES": 4,
+    "SLICE_RADIUS": 2,
+    "CONTEXT_SLICES": 4,
+    "IN_CHANNELS": 20,
+    "OUT_CHANNELS": 4,
+    "BASE_CHANNELS": 64,
+    "CHANNEL_MULTS": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "TIME_EMB_DIM": 256,
+    "NUM_IMAGES": 4000,
+    "BATCH_SIZE": 32,
+    "DIV_PAIRS": 2000,
+    "DIVERSITY_RESIZE_TO": 256,
+    "ISC_NUM_SEQUENCES": 50,
+    "ISC_WINDOW": 16,
+    "ISC_SAMPLE_BATCH": 32,
+    "DO_COND_RECON": true,
+    "COND_RECON_SAMPLES": 256,
+    "COND_RECON_BATCH": 32,
+    "SEED": 123,
+    "DEVICE": "auto",
+    "MIXED_PRECISION": "fp16",
+    "DEBUG": false,
+    "DEBUG_ONLY": false,
+    "SMOKE_FOLDER_METRICS": true,
+    "SMOKE_N": 64,
+    "DEBUG_CAP_NUM_IMAGES": 256
+  },
+  "torch_fidelity_by_modality": {
+    "t1": {
+      "frechet_inception_distance": 42.89987197390283,
+      "kernel_inception_distance_mean": 0.03530473232269287,
+      "kernel_inception_distance_std": 0.0010086089415310398,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 4000,
+      "n_fake": 4000
+    },
+    "t1ce": {
+      "frechet_inception_distance": 40.55608181880734,
+      "kernel_inception_distance_mean": 0.03476712942123413,
+      "kernel_inception_distance_std": 0.0008772410802406277,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 4000,
+      "n_fake": 4000
+    },
+    "t2": {
+      "frechet_inception_distance": 30.00769713285777,
+      "kernel_inception_distance_mean": 0.02293712615966797,
+      "kernel_inception_distance_std": 0.0008140986088852822,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 4000,
+      "n_fake": 4000
+    },
+    "flair": {
+      "frechet_inception_distance": 34.00750028170873,
+      "kernel_inception_distance_mean": 0.029735860824584962,
+      "kernel_inception_distance_std": 0.0008268099690120832,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 4000,
+      "n_fake": 4000
+    }
+  },
+  "torch_fidelity_macro": {
+    "fid_macro": 36.86778780181917,
+    "kid_mean_macro": 0.03068621218204498,
+    "kid_std_macro": 0.0008816896499172582,
+    "precision_macro": NaN,
+    "recall_macro": NaN
+  },
+  "diversity_by_modality": {
+    "t1": {
+      "ms_ssim_pair_mean": 0.6066357867270709,
+      "ms_ssim_pair_std": 0.08886420142629298,
+      "lpips_pair_mean": 0.2648734768722206,
+      "lpips_pair_std": 0.07745657522465925,
+      "diversity_num_loaded": 2520,
+      "diversity_num_pairs": 2000
+    },
+    "t1ce": {
+      "ms_ssim_pair_mean": 0.6484719740450382,
+      "ms_ssim_pair_std": 0.08027518345968397,
+      "lpips_pair_mean": 0.26068659383244813,
+      "lpips_pair_std": 0.06844268137706776,
+      "diversity_num_loaded": 2520,
+      "diversity_num_pairs": 2000
+    },
+    "t2": {
+      "ms_ssim_pair_mean": 0.6335197223722935,
+      "ms_ssim_pair_std": 0.08238664922557705,
+      "lpips_pair_mean": 0.2530142395775765,
+      "lpips_pair_std": 0.07108577856155303,
+      "diversity_num_loaded": 2520,
+      "diversity_num_pairs": 2000
+    },
+    "flair": {
+      "ms_ssim_pair_mean": 0.6389628215283155,
+      "ms_ssim_pair_std": 0.08224337113911803,
+      "lpips_pair_mean": 0.2597419819440693,
+      "lpips_pair_std": 0.06914712482888491,
+      "diversity_num_loaded": 2520,
+      "diversity_num_pairs": 2000
+    }
+  },
+  "diversity_macro": {
+    "ms_ssim_pair_mean_macro": 0.6318975761681795,
+    "lpips_pair_mean_macro": 0.2595790730565787
+  }
+}

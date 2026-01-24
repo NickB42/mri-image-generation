@@ -60,7 +60,7 @@ source venv/bin/activate
 
 echo "Running module: $MODULE"
 echo "CWD: $(pwd)"
-echo "Command: python -m $MODULE $*"
+echo "Command: python -u -m $MODULE $*"
 echo
 
 # Run generation

@@ -102,20 +102,6 @@ class BraTSSliceDataset(Dataset):
         slice_t = slice_t * 2.0 - 1.0  # -> [-1, 1]
         return slice_t
 
-    def __getitem__(self, idx):
-        path, z = self.slice_tuples[idx]
-
-        vol = self._load_volume(path)
-        slice_2d = vol[:, :, z]
-        ...
-        slice_t = slice_t * 2.0 - 1.0
-
-        # z normalization:
-        D = vol.shape[-1]
-        z_pos = np.float32(z / (D - 1))
-
-        return slice_t, z_pos
-
     def __len__(self):
         return len(self.slice_tuples)
 

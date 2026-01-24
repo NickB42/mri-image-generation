@@ -35,7 +35,7 @@ RUN_IDENTIFIER = os.environ.get("SLURM_JOB_ID") or str(uuid.uuid4())
 
 # 3D patch size (D, H, W)
 PATCH_SIZE = (128, 160, 160)
-TIMESTEPS = 400
+TIMESTEPS = 200
 
 # VAE hyperparams
 VAE_NUM_EPOCHS = 40
@@ -55,10 +55,10 @@ MIN_DELTA = 1e-4
 UNET_BASE_CHANNELS = 128
 UNET_CHANNEL_MULTS = (1, 2, 4)
 
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 NUM_WORKERS = 8
 
-DEBUG_FAST = True
+DEBUG_FAST = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME

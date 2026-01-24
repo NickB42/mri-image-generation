@@ -1,16 +1,12 @@
 from pathlib import Path
-from typing import Union, Optional
-import json, os
-from datetime import datetime
-import sys
+from typing import Union
+import os
 import uuid
-import signal
 import time
 
 import torch
 from torch.utils.data import DataLoader, random_split, Subset
 from torch.amp import autocast, GradScaler
-from torchvision.utils import save_image
 
 import mlflow
 import mlflow.pytorch
@@ -48,7 +44,7 @@ SHOULD_TERMINATE = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
-DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
+DATASET_ROOT = (PROJECT_ROOT / "../datasets").resolve()
 
 print("Using DATASET_ROOT:", DATASET_ROOT)
 
@@ -73,22 +69,6 @@ print("CUDA_VISIBLE_DEVICES:", os.getenv("CUDA_VISIBLE_DEVICES"))
 for i in range(torch.cuda.device_count()):
     props = torch.cuda.get_device_properties(i)
     print(f"[GPU {i}] {props.name}, {props.total_memory / (1024**3):.1f} GB")
-# -------------------------------------------------------------------
-# Signal handlers for graceful shutdown
-# -------------------------------------------------------------------
-def _handle_sigusr1(signum, frame):
-    global SHOULD_TERMINATE
-    print(f"[Signal] Received SIGUSR1 ({signum}). Requested graceful shutdown.")
-    SHOULD_TERMINATE = True
-
-def _handle_sigterm(signum, frame):
-    global SHOULD_TERMINATE
-    print(f"[Signal] Received SIGTERM ({signum}). Emergency shutdown requested.")
-    SHOULD_TERMINATE = True
-
-def install_signal_handlers():
-    signal.signal(signal.SIGUSR1, _handle_sigusr1)
-    signal.signal(signal.SIGTERM, _handle_sigterm)
 # -------------------------------------------------------------------
 # Dataset and DataLoaders
 # -------------------------------------------------------------------
@@ -417,5 +397,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    install_signal_handlers()
     main()

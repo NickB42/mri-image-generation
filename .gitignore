@@ -16,4 +16,9 @@ perun_results/
 
 perun_debug/
 
+eval_out/**/fake_png/
+eval_out/**/real_png/
+
 slice_cond_2d_ddpm_builtin/
+
+med_ddpm/

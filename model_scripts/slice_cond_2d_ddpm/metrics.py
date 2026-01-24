@@ -1,522 +1,901 @@
 """
-Evaluate a slice-position-conditioned 2D DDPM on BraTS slices.
+Evaluation script for your slice-position-conditioned DDPM on BraTS NIfTI volumes.
 
 Computes:
-  - FID, KID (global)
-  - FID, KID per z_pos bin
-  - Diversity: MS-SSIM (gen1 vs gen2), LPIPS (gen1 vs gen2)
-  - Optional: Improved Precision/Recall (Kynkäänniemi et al.) on ResNet18 features
+  - FID, KID, PRC (precision/recall) using torch-fidelity on folders of PNGs
+  - Diversity on generated samples: MS-SSIM + LPIPS (random pairs)
+  - Inter-slice consistency: adjacent-slice SSIM + L1 (real vs synthetic windows)
 
-Assumptions:
-  - This script is placed next to: dataset.py, unet.py, diffusion.py
-  - Your dataset returns: (slice_t in [-1,1] of shape [1,H,W], z_pos in [0,1])
-  - Your checkpoint is diffusion.state_dict() saved from training
+Updates in this version:
+  - No tqdm (Slurm-friendly)
+  - Mixed precision (Accelerate)
+  - Step 5 (ISC) uses all GPUs (distributed sharding + reduce)
+  - Save results after step 4 and after step 5
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import random
+from glob import glob
+from typing import Any, Dict, List, Tuple
 from pathlib import Path
-from typing import Dict, List, Tuple
+from datetime import timedelta
+
+import numpy as np
+from PIL import Image
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
 
-from .dataset import BraTSSliceDataset
+import nibabel as nib
+import torch_fidelity
+
+from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from accelerate.utils import InitProcessGroupKwargs
+from accelerate.utils import broadcast_object_list
+
 from .unet import UNet
 from .diffusion import GaussianDiffusion
 
 
-def seed_all(seed: int) -> None:
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+# ============================================================
+# CONFIG CONSTANTS
+# ============================================================
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENTS_ROOT = (PROJECT_ROOT / "slice_cond_2d_ddpm").resolve()
+BRATS_ROOT = (PROJECT_ROOT / "../datasets/test").resolve()
+MODALITY = "flair"
+CHECKPOINT = str(EXPERIMENTS_ROOT / "models" / "1591624" / "2d_central_ddpm_flair_best.pt")
+SLURM_JOB_ID = os.environ.get("SLURM_JOB_ID")
+OUT_DIR = f"./eval_out/slice/{SLURM_JOB_ID}"
+
+# Model / diffusion
+IMAGE_SIZE = 128
+TIMESTEPS = 1000
+
+# UNet args
+IMG_CHANNELS = 1
+BASE_CHANNELS = 64
+CHANNEL_MULTS = (1, 2, 4, 8)
+TIME_EMB_DIM = 256
+
+# sampling distribution for z_pos
+Z_MIN = 0.0
+Z_MAX = 1.0
+
+# counts
+NUM_IMAGES = 4000
+BATCH_SIZE = 32
+
+# normalization percentiles
+P_LO = 0.5
+P_HI = 99.5
+
+# diversity
+DIV_PAIRS = 2000
+
+# inter-slice consistency
+ISC_NUM_SEQUENCES = 50
+ISC_WINDOW = 16
+
+# misc
+SEED = 123
+DEVICE = "auto"
+
+# mixed precision (Accelerate): "fp16", "bf16", or "no"
+MIXED_PRECISION = "fp16"
+
+# logging (Slurm-friendly: low volume)
+ISC_LOG_EVERY_LOCAL = 2  # each rank prints every N local sequences in step 5
+
+# debug
+DEBUG = False
+DEBUG_ONLY = False
+SMOKE_FOLDER_METRICS = True
+SMOKE_N = 64
+DEBUG_CAP_NUM_IMAGES = 256
 
 
-def pick_device(device_str: str | None) -> torch.device:
-    if device_str:
-        return torch.device(device_str)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+# ----------------------------
+# Helpers
+# ----------------------------
+def chunked(seq, n: int):
+    """Yield successive n-sized chunks from a list."""
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
 
 
-def to_01(x: torch.Tensor) -> torch.Tensor:
-    # model/data are in [-1,1]
-    x = (x + 1.0) * 0.5
+def save_json(path: str, obj: Any) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
+def log_main(accelerator: Accelerator, msg: str) -> None:
+    if accelerator.is_main_process:
+        print(msg, flush=True)
+
+
+# ----------------------------
+# BraTS helpers
+# ----------------------------
+def find_subject_dirs(brats_root: str) -> List[str]:
+    subs = [p for p in glob(os.path.join(brats_root, "*")) if os.path.isdir(p)]
+    subs.sort()
+    if not subs:
+        raise FileNotFoundError(f"No subject directories under {brats_root}")
+    return subs
+
+
+def find_modality_file(subject_dir: str, modality: str) -> str:
+    modality = modality.lower()
+    patterns = [f"*_{modality}.nii*", f"*_{modality.upper()}.nii*"]
+    if modality in ("t1ce", "t1c"):
+        patterns += ["*_t1ce.nii*", "*_t1c.nii*", "*_T1CE.nii*", "*_T1C.nii*"]
+
+    candidates: List[str] = []
+    for pat in patterns:
+        candidates += glob(os.path.join(subject_dir, pat))
+    candidates = sorted(set(candidates))
+    if not candidates:
+        raise FileNotFoundError(f"No '{modality}' NIfTI found in {subject_dir}")
+    return candidates[0]
+
+
+def load_nifti(path: str) -> np.ndarray:
+    img = nib.load(path)
+    data = img.get_fdata(dtype=np.float32)
+    if data.ndim == 4 and data.shape[-1] == 1:
+        data = data[..., 0]
+    if data.ndim != 3:
+        raise ValueError(f"Expected 3D NIfTI, got {data.shape} at {path}")
+    return data  # H,W,Z
+
+
+def percentile_lohi_nonzero(x: np.ndarray, p_lo: float, p_hi: float) -> Tuple[float, float]:
+    x = x.astype(np.float32)
+    nz = x[x != 0]
+    if nz.size < 500:
+        nz = x.reshape(-1)
+    lo, hi = np.percentile(nz, [p_lo, p_hi])
+    if hi <= lo:
+        hi = lo + 1e-6
+    return float(lo), float(hi)
+
+
+def to_u8(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    x = np.clip(x.astype(np.float32), lo, hi)
+    x = (x - lo) / (hi - lo + 1e-8)
+    return (x * 255.0).round().astype(np.uint8)
+
+
+def resize_u8_square(u8_hw: np.ndarray, size: int) -> np.ndarray:
+    im = Image.fromarray(u8_hw)
+    im = im.resize((size, size), resample=Image.BILINEAR)
+    return np.asarray(im, dtype=np.uint8)
+
+
+def save_gray_as_rgb_png(u8_hw: np.ndarray, out_path: str) -> None:
+    rgb = np.stack([u8_hw, u8_hw, u8_hw], axis=-1)
+    Image.fromarray(rgb).save(out_path)
+
+
+def make_grid(image_paths: List[str], nrow: int, out_path: str, pad: int = 4) -> None:
+    ims = [Image.open(p).convert("RGB") for p in image_paths]
+    if not ims:
+        return
+    w, h = ims[0].size
+    n = len(ims)
+    ncol = nrow
+    nrow_grid = int(np.ceil(n / ncol))
+    canvas = Image.new(
+        "RGB",
+        (ncol * w + (ncol + 1) * pad, nrow_grid * h + (nrow_grid + 1) * pad),
+        color=(20, 20, 20),
+    )
+    for idx, im in enumerate(ims):
+        r = idx // ncol
+        c = idx % ncol
+        x = pad + c * (w + pad)
+        y = pad + r * (h + pad)
+        canvas.paste(im, (x, y))
+    canvas.save(out_path)
+
+
+# ----------------------------
+# Model build + checkpoint load
+# ----------------------------
+def build_diffusion(
+    image_size: int,
+    timesteps: int,
+    device: torch.device,
+    img_channels: int = 1,
+    base_channels: int = 64,
+    channel_mults: Tuple[int, ...] = (1, 2, 4, 8),
+    time_emb_dim: int = 256,
+) -> torch.nn.Module:
+    model = UNet(
+        img_channels=img_channels,
+        base_channels=base_channels,
+        channel_mults=channel_mults,
+        time_emb_dim=time_emb_dim,
+    ).to(device)
+
+    diffusion = GaussianDiffusion(
+        model=model,
+        image_size=image_size,
+        channels=img_channels,
+        timesteps=timesteps,
+    ).to(device)
+
+    return diffusion
+
+
+def load_checkpoint_like_yours(diffusion: torch.nn.Module, checkpoint_path: str, device: torch.device) -> None:
+    state_dict = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(state_dict, dict) and any(k.startswith("model.module.") for k in state_dict.keys()):
+        print("Detected DataParallel-style keys 'model.module.*' -> rewriting to 'model.*'")
+        new_state = {}
+        for k, v in state_dict.items():
+            if k.startswith("model.module."):
+                new_state[k.replace("model.module.", "model.", 1)] = v
+            else:
+                new_state[k] = v
+        state_dict = new_state
+
+    missing, unexpected = diffusion.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[warn] Missing keys ({len(missing)}): {missing[:10]}{'...' if len(missing) > 10 else ''}")
+    if unexpected:
+        print(f"[warn] Unexpected keys ({len(unexpected)}): {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+    print(f"Loaded checkpoint: {checkpoint_path}")
+
+
+@torch.inference_mode()
+def diffusion_sample_01(diffusion: torch.nn.Module, z_pos: torch.Tensor) -> torch.Tensor:
+    """
+    Returns samples in [0,1], shape [B,1,H,W].
+    Your diffusion.sample returns [-1,1].
+    """
+    out = diffusion.sample(batch_size=int(z_pos.shape[0]), z_pos=z_pos)
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    x = torch.as_tensor(out, device=z_pos.device)
+
+    if x.ndim == 3:
+        x = x.unsqueeze(1)
+    if x.shape[1] != 1:
+        x = x[:, :1]
+
+    x = x.clamp(-1, 1)
+    x = (x + 1.0) / 2.0
     return x.clamp(0.0, 1.0)
 
 
-def to_3ch(x: torch.Tensor) -> torch.Tensor:
-    # x: (N,C,H,W)
-    if x.shape[1] == 1:
-        return x.repeat(1, 3, 1, 1)
-    return x
+# ----------------------------
+# Metrics
+# ----------------------------
+def torch_fidelity_folder_metrics(
+    real_dir: str,
+    fake_dir: str,
+    use_cuda: bool,
+    kid_subset_size: int = 1000,
+    kid_subsets: int = 100,
+    num_workers: int = 2,
+    batch_size: int = 16,
+) -> Dict[str, float]:
+    n1 = len(glob(os.path.join(real_dir, "*.png")))
+    n2 = len(glob(os.path.join(fake_dir, "*.png")))
+    n = min(n1, n2)
+    kid_subset_size = min(kid_subset_size, n)
+    kid_flag = (n >= 2) and (kid_subset_size >= 2)
 
+    m = torch_fidelity.calculate_metrics(
+        input1=fake_dir,
+        input2=real_dir,
+        cuda=bool(use_cuda),
+        fid=True,
+        kid=kid_flag,
+        prc=True,
+        verbose=False,
+        kid_subset_size=kid_subset_size,
+        kid_subsets=kid_subsets,
+        num_workers=num_workers,
+        batch_size=batch_size,
+    )
 
-def fix_state_dict_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Handle checkpoints saved when diffusion.model was wrapped in DataParallel.
-    Typical prefix patterns:
-      - "model.module.<...>"
-      - sometimes "module.<...>"
-    """
-    out = {}
-    for k, v in sd.items():
-        nk = k
-        if nk.startswith("model.module."):
-            nk = "model." + nk[len("model.module.") :]
-        if nk.startswith("module."):
-            nk = nk[len("module.") :]
-        out[nk] = v
+    out: Dict[str, float] = {}
+    for k, v in m.items():
+        try:
+            out[k] = float(v)
+        except Exception:
+            pass
+    out["kid_subset_size_used"] = int(kid_subset_size)
+    out["kid_enabled"] = bool(kid_flag)
+    out["n_real"] = int(n1)
+    out["n_fake"] = int(n2)
     return out
 
 
-def volume_split_indices(dataset: BraTSSliceDataset, seed: int, test_frac: float) -> List[int]:
-    """
-    Split by *volume* so slices from the same patient/volume don't leak across sets.
-    Returns indices for the test subset.
-    """
-    rng = random.Random(seed)
-    vol_paths = list(dataset.volume_paths)
-    rng.shuffle(vol_paths)
-
-    n_test = max(1, int(round(len(vol_paths) * test_frac)))
-    test_paths = set(vol_paths[:n_test])
-
-    test_indices = [i for i, (p, _z) in enumerate(dataset.slice_tuples) if p in test_paths]
-    return test_indices
-
-
-@torch.no_grad()
-def sample_like_real_batch(
-    diffusion: GaussianDiffusion,
-    z_pos: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Generate a batch conditioned on the provided z_pos values.
-    Returns tensor in [-1,1], shape (B,1,H,W)
-    """
-    z_pos = z_pos.to(device).float()
-    return diffusion.sample(batch_size=z_pos.shape[0], z_pos=z_pos)
-
-
-def safe_mean(xs: List[float]) -> float:
-    return float(sum(xs) / max(1, len(xs)))
-
-
-def safe_std(xs: List[float]) -> float:
-    if len(xs) < 2:
-        return 0.0
-    m = safe_mean(xs)
-    return float(math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)))
-
-
-def build_torchmetrics(device: torch.device):
-    try:
-        from torchmetrics.image.fid import FrechetInceptionDistance
-        from torchmetrics.image.kid import KernelInceptionDistance
-        from torchmetrics.image import StructuralSimilarityIndexMeasure
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-    except ImportError as e:
-        raise SystemExit(
-            "Missing deps. Install with:\n"
-            "  pip install torchmetrics torchvision torch-fidelity\n\n"
-            f"Original error: {e}"
-        )
-
-    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-    # KID: subset_size must be <= number of samples seen; we’ll set later safely.
-    kid = KernelInceptionDistance(feature=2048, subsets=50, subset_size=500, normalize=True).to(device)
-
-    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    # LPIPS default normalize=False => expects [-1,1]
-    lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=False).to(device)
-
-    return fid, kid, ssim, lpips
-
-
-def pr_features_resnet18(x01_3ch: torch.Tensor) -> torch.Tensor:
-    """
-    Extract features using a torchvision ResNet18 backbone (global average pooled output).
-    x01_3ch: float in [0,1], shape (N,3,H,W)
-    returns: (N,512)
-    """
-    from torchvision.models import resnet18, ResNet18_Weights
-    import torch.nn as nn
-
-    weights = ResNet18_Weights.DEFAULT
-    model = resnet18(weights=weights)
-    model.fc = nn.Identity()
-    model.eval()
-
-    return model
-
-
-def imagenet_normalize(x01_3ch: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor([0.485, 0.456, 0.406], device=x01_3ch.device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=x01_3ch.device).view(1, 3, 1, 1)
-    return (x01_3ch - mean) / std
-
-
-def knn_radii(feats: torch.Tensor, k: int = 3, chunk: int = 256) -> torch.Tensor:
-    """
-    For each feature vector, compute distance to its k-th nearest neighbor within the same set.
-    feats: (N,D)
-    Returns radii: (N,)
-    """
-    N = feats.shape[0]
-    radii = torch.empty((N,), device=feats.device, dtype=feats.dtype)
-
-    for i in range(0, N, chunk):
-        j = min(i + chunk, N)
-        x = feats[i:j]  # (B,D)
-        d = torch.cdist(x, feats)  # (B,N)
-        idx = torch.arange(i, j, device=feats.device)
-        d[torch.arange(j - i, device=feats.device), idx] = float("inf")  # exclude self
-        radii[idx] = torch.kthvalue(d, k, dim=1).values
-
-    return radii
-
-
-def membership_fraction(
-    queries: torch.Tensor,
-    manifold: torch.Tensor,
-    manifold_radii: torch.Tensor,
-    q_chunk: int = 128,
-) -> float:
-    """
-    Fraction of queries that fall inside the union of hyperspheres around manifold points,
-    where each manifold point has radius manifold_radii.
-    """
-    Nq = queries.shape[0]
-    inside_count = 0
-
-    for i in range(0, Nq, q_chunk):
-        j = min(i + q_chunk, Nq)
-        q = queries[i:j]  # (B,D)
-        d = torch.cdist(q, manifold)  # (B,Nm)
-        inside = (d <= manifold_radii.unsqueeze(0)).any(dim=1)
-        inside_count += int(inside.sum().item())
-
-    return inside_count / max(1, Nq)
-
-
-@torch.no_grad()
-def compute_improved_pr(
-    real_feats: torch.Tensor,
-    fake_feats: torch.Tensor,
-    k: int = 3,
-) -> Tuple[float, float]:
-    """
-    Improved precision/recall from Kynkäänniemi et al.:
-      precision: fraction of fake within real manifold
-      recall:    fraction of real within fake manifold
-    """
-    r_radii = knn_radii(real_feats, k=k)
-    f_radii = knn_radii(fake_feats, k=k)
-
-    precision = membership_fraction(fake_feats, real_feats, r_radii)
-    recall = membership_fraction(real_feats, fake_feats, f_radii)
-    return float(precision), float(recall)
-
-
-def main() -> None:
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    DATASET_ROOT = (PROJECT_ROOT / "../datasets/dataset").resolve()
-    EXPERIMENTS_ROOT = PROJECT_ROOT / "slice_cond_2d_ddpm"
-    MODEL_ROOT = EXPERIMENTS_ROOT / "models"
-    
-    # Configuration variables
-    dataset_root = str(DATASET_ROOT)
-    ckpt_path = str(MODEL_ROOT / "1591624" /"2d_central_ddpm_flair_best.pt")
-    image_size = 128
-    timesteps = None  # If None, inferred from checkpoint betas length
-    batch_size = 16
-    num_workers = 0
-    num_samples = 1000  # How many real samples to compare (and how many generated)
-    test_frac = 0.15  # Volume-level test split fraction
-    seed = 42
-    device_str = None
-    
-    z_bins = 8
-    diversity_pairs = 64  # How many (gen1,gen2) pairs for MS-SSIM/LPIPS
-    save_samples = False
-    out_dir_path = "./eval_out"
-    
-    compute_pr = False  # Compute improved precision/recall (slower)
-    pr_samples = 500  # How many samples for PR (real & fake). Keep <= 2000 for speed
-    
-    # Create simple namespace object to hold args
-    class Args:
-        pass
-    
-    args = Args()
-    args.dataset_root = dataset_root
-    args.ckpt = ckpt_path
-    args.image_size = image_size
-    args.timesteps = timesteps
-    args.batch_size = batch_size
-    args.num_workers = num_workers
-    args.num_samples = num_samples
-    args.test_frac = test_frac
-    args.seed = seed
-    args.device = device_str
-    args.z_bins = z_bins
-    args.diversity_pairs = diversity_pairs
-    args.save_samples = save_samples
-    args.out_dir = out_dir_path
-    args.compute_pr = compute_pr
-    args.pr_samples = pr_samples
-
-    seed_all(args.seed)
-    device = pick_device(args.device)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load checkpoint first to infer timesteps if needed
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    if not isinstance(ckpt, dict):
-        raise SystemExit("Checkpoint does not look like a diffusion.state_dict() dict.")
-    ckpt = fix_state_dict_keys(ckpt)
-
-    if args.timesteps is None:
-        if "betas" not in ckpt:
-            raise SystemExit("Could not infer timesteps: checkpoint missing 'betas' buffer.")
-        args.timesteps = int(ckpt["betas"].numel())
-
-    # Build model & diffusion
-    model = UNet(
-        img_channels=1,
-        base_channels=64,
-        channel_mults=(1, 2, 4, 8),
-        time_emb_dim=256,
-    )
-    diffusion = GaussianDiffusion(
-        model=model,
-        image_size=args.image_size,
-        channels=1,
-        timesteps=args.timesteps,
-    )
-    missing, unexpected = diffusion.load_state_dict(ckpt, strict=False)
-    diffusion = diffusion.to(device).eval()
-
-    print(f"Loaded ckpt. missing={len(missing)} unexpected={len(unexpected)} timesteps={args.timesteps}")
-
-    # Dataset (volume-level test split)
-    dataset = BraTSSliceDataset(args.dataset_root, image_size=args.image_size)
-    test_indices = volume_split_indices(dataset, seed=args.seed, test_frac=args.test_frac)
-    test_ds = Subset(dataset, test_indices)
-
-    loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
-
-    # Metrics
-    fid, kid, ssim, lpips = build_torchmetrics(device)
-
-    # Per-z-bin metrics
-    z_bins = int(args.z_bins)
-    edges = torch.linspace(0.0, 1.0, z_bins + 1)
-    fid_bins = [type(fid)(feature=2048, normalize=True).to(device) for _ in range(z_bins)]
-    kid_bins = [type(kid)(feature=2048, subsets=20, subset_size=200, normalize=True).to(device) for _ in range(z_bins)]
-
-    # Optionally save some samples
-    if args.save_samples:
-        try:
-            from torchvision.utils import save_image
-        except ImportError:
-            save_image = None
-            print("torchvision not available; cannot save samples.")
-
-    # Main loop: stream updates into FID/KID
-    seen = 0
-    for real, z_pos in loader:
-        if seen >= args.num_samples:
-            break
-
-        b = real.shape[0]
-        take = min(b, args.num_samples - seen)
-        real = real[:take]
-        z_pos = z_pos[:take]
-
-        # Generate matched-condition fakes
-        fake = sample_like_real_batch(diffusion, z_pos=z_pos, device=device)
-
-        # FID/KID expect 3ch RGB; normalize=True => float in [0,1]
-        real_01_3 = to_3ch(to_01(real.to(device)))
-        fake_01_3 = to_3ch(to_01(fake))
-
-        fid.update(real_01_3, real=True)
-        fid.update(fake_01_3, real=False)
-        kid.update(real_01_3, real=True)
-        kid.update(fake_01_3, real=False)
-
-        # Per-bin
-        z = z_pos.cpu()
-        bin_idx = torch.bucketize(z, edges[1:-1], right=False)  # 0..z_bins-1
-        for bi in range(z_bins):
-            m = (bin_idx == bi)
-            if m.any():
-                rb = real_01_3[m.to(device)]
-                fb = fake_01_3[m.to(device)]
-                fid_bins[bi].update(rb, real=True)
-                fid_bins[bi].update(fb, real=False)
-                kid_bins[bi].update(rb, real=True)
-                kid_bins[bi].update(fb, real=False)
-
-        # Save a small grid (first batch only)
-        if args.save_samples and seen == 0:
-            if save_image is not None:
-                save_image(to_01(real.to(device)), out_dir / "real_examples.png", nrow=8)
-                save_image(to_01(fake), out_dir / "fake_examples.png", nrow=8)
-
-        seen += take
-        if seen % (args.batch_size * 10) == 0:
-            print(f"Processed {seen}/{args.num_samples} samples...")
-
-    # Compute global FID/KID
-    fid_score = float(fid.compute().detach().cpu().item())
-    kid_mean, kid_std = kid.compute()
-    kid_mean = float(kid_mean.detach().cpu().item())
-    kid_std = float(kid_std.detach().cpu().item())
-
-    # Compute per-bin
-    per_bin = {}
-    for bi in range(z_bins):
-        # If a bin got no samples, compute() may error; guard it.
-        try:
-            f = float(fid_bins[bi].compute().detach().cpu().item())
-        except Exception:
-            f = None
-        try:
-            km, ks = kid_bins[bi].compute()
-            km = float(km.detach().cpu().item())
-            ks = float(ks.detach().cpu().item())
-        except Exception:
-            km, ks = None, None
-
-        per_bin[f"bin_{bi}"] = {
-            "z_range": [float(edges[bi].item()), float(edges[bi + 1].item())],
-            "fid": f,
-            "kid_mean": km,
-            "kid_std": ks,
-        }
-
-    # Diversity: generate (gen1, gen2) pairs at random z positions
-    ssim_vals: List[float] = []
-    lpips_vals: List[float] = []
-    pairs_done = 0
-
-    # sample z_pos uniformly across [0,1]
-    while pairs_done < args.diversity_pairs:
-        b = min(args.batch_size, args.diversity_pairs - pairs_done)
-        z_pos = torch.rand((b,), device=device)
-
-        g1 = diffusion.sample(batch_size=b, z_pos=z_pos)  # [-1,1]
-        g2 = diffusion.sample(batch_size=b, z_pos=z_pos)  # [-1,1]
-
-        g1_01 = to_01(g1)
-        g2_01 = to_01(g2)
-
-        # MS-SSIM in [0,1], provide data_range=1.0
-        s = ssim(to_3ch(g1_01), to_3ch(g2_01))
-        ssim_vals.append(float(s.detach().cpu().item()))
-
-        # LPIPS expects (N,3,H,W), default normalize=False => [-1,1]
-        lp = lpips(to_3ch(g1), to_3ch(g2))
-        lpips_vals.append(float(lp.detach().cpu().item()))
-
-        pairs_done += b
-
-    # Optional improved precision/recall
-    pr_precision = None
-    pr_recall = None
-    if args.compute_pr:
-        from torchvision.models import resnet18, ResNet18_Weights
-        import torch.nn as nn
-
-        feat_net = resnet18(weights=ResNet18_Weights.DEFAULT)
-        feat_net.fc = nn.Identity()
-        feat_net = feat_net.to(device).eval()
-
-        def extract_feats(stream_real: bool, n: int) -> torch.Tensor:
-            feats = []
-            got = 0
-            for real, z_pos in loader:
-                if got >= n:
-                    break
-                b = real.shape[0]
-                take = min(b, n - got)
-                real = real[:take]
-                z_pos = z_pos[:take]
-
-                if stream_real:
-                    x = to_3ch(to_01(real.to(device)))
-                else:
-                    x = to_3ch(to_01(sample_like_real_batch(diffusion, z_pos, device)))
-
-                # ResNet expects ~ImageNet normalization
-                x = imagenet_normalize(x)
-                x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
-
-                f = feat_net(x)  # (B,512)
-                feats.append(f.detach())
-                got += take
-            return torch.cat(feats, dim=0)
-
-        npr = int(args.pr_samples)
-        real_feats = extract_feats(True, npr)
-        fake_feats = extract_feats(False, npr)
-
-        pr_precision, pr_recall = compute_improved_pr(real_feats, fake_feats, k=3)
-
-    results = {
-        "ckpt": str(Path(args.ckpt).resolve()),
-        "dataset_root": str(Path(args.dataset_root).resolve()),
-        "num_samples": int(seen),
-        "fid": fid_score,
-        "kid_mean": kid_mean,
-        "kid_std": kid_std,
-        "per_z_bin": per_bin,
-        "diversity": {
-            "ssim_mean": safe_mean(ssim_vals),
-            "ssim_std": safe_std(ssim_vals),
-            "lpips_mean": safe_mean(lpips_vals),
-            "lpips_std": safe_std(lpips_vals),
-            "pairs": int(args.diversity_pairs),
-        },
-        "improved_precision_recall": {
-            "enabled": bool(args.compute_pr),
-            "precision": pr_precision,
-            "recall": pr_recall,
-            "k": 3,
-            "samples": int(args.pr_samples) if args.compute_pr else None,
-        },
-        "notes": {
-            "fid_kid_inputs": "FID/KID computed on float images in [0,1] (normalize=True) and repeated to 3 channels.",
-            "lpips_inputs": "LPIPS computed on images in [-1,1] (normalize=False) and repeated to 3 channels.",
-        },
+@torch.inference_mode()
+def diversity_metrics(fake_dir: str, device: torch.device, num_pairs: int, resize_to: int = 256) -> Dict[str, float]:
+    paths = sorted(glob(os.path.join(fake_dir, "*.png")))
+    if len(paths) < 2:
+        return {"ms_ssim_pair_mean": float("nan"), "lpips_pair_mean": float("nan")}
+
+    max_load = min(len(paths), max(300, int(np.sqrt(len(paths))) * 40))
+    paths = random.sample(paths, k=max_load)
+
+    imgs = []
+    for p in paths:
+        im = Image.open(p).convert("RGB")
+        arr = np.asarray(im).astype(np.float32) / 255.0
+        imgs.append(torch.from_numpy(arr).permute(2, 0, 1))
+    x = torch.stack(imgs, dim=0).to(device)
+    if resize_to:
+        x = F.interpolate(x, size=(resize_to, resize_to), mode="bilinear", align_corners=False)
+
+    ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0, sync_on_compute=False).to(device)
+    lpips = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True, sync_on_compute=False).to(device)
+
+    n = x.shape[0]
+    pairs = [tuple(random.sample(range(n), 2)) for _ in range(num_pairs)]
+    ms_vals, lp_vals = [], []
+    for i, j in pairs:
+        a, b = x[i : i + 1], x[j : j + 1]
+        ms_vals.append(ms_ssim(a, b).item())
+        lp_vals.append(lpips(a, b).item())
+
+    return {
+        "ms_ssim_pair_mean": float(np.mean(ms_vals)),
+        "ms_ssim_pair_std": float(np.std(ms_vals)),
+        "lpips_pair_mean": float(np.mean(lp_vals)),
+        "lpips_pair_std": float(np.std(lp_vals)),
+        "diversity_num_loaded": int(n),
+        "diversity_num_pairs": int(num_pairs),
     }
 
-    out_path = out_dir / "metrics.json"
-    out_path.write_text(json.dumps(results, indent=2))
-    print("\n=== Results ===")
-    print(json.dumps(results, indent=2))
-    print(f"\nSaved to: {out_path}")
+
+@torch.inference_mode()
+def inter_slice_consistency_distributed(
+    accelerator: Accelerator,
+    diffusion: torch.nn.Module,
+    subject_dirs: List[str],
+    modality: str,
+    device: torch.device,
+    image_size: int,
+    num_sequences: int,
+    window: int,
+    p_lo: float,
+    p_hi: float,
+    z_min: float,
+    z_max: float,
+    log_every_local: int = 2,
+) -> Dict[str, float]:
+    """
+    Distributed ISC:
+      - Main process selects 'chosen' subjects and broadcasts to all ranks
+      - Each rank processes chosen[rank::world_size]
+      - One reduce at the end to combine sum/sumsq/count for each metric
+    """
+    # Pick sequences on main and broadcast so all ranks agree on the same set
+    if accelerator.is_main_process:
+        chosen = random.sample(subject_dirs, k=min(num_sequences, len(subject_dirs)))
+        obj_list = [chosen]
+    else:
+        obj_list = [None]
+    broadcast_object_list(obj_list)
+    chosen = obj_list[0]
+
+    local_chosen = chosen[accelerator.process_index :: accelerator.num_processes]
+
+    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0, sync_on_compute=False).to(device)
+
+    # We accumulate (sum, sumsq, count) for 4 metrics:
+    # real_ssim, fake_ssim, real_l1, fake_l1
+    sum_real_ssim = 0.0
+    sumsq_real_ssim = 0.0
+    cnt_real_ssim = 0
+
+    sum_fake_ssim = 0.0
+    sumsq_fake_ssim = 0.0
+    cnt_fake_ssim = 0
+
+    sum_real_l1 = 0.0
+    sumsq_real_l1 = 0.0
+    cnt_real_l1 = 0
+
+    sum_fake_l1 = 0.0
+    sumsq_fake_l1 = 0.0
+    cnt_fake_l1 = 0
+
+    local_sequences_used = 0
+    local_skipped = 0
+
+    for idx, sdir in enumerate(local_chosen, start=1):
+        vol = load_nifti(find_modality_file(sdir, modality))
+        _, _, Z = vol.shape
+        if Z < window + 1:
+            local_skipped += 1
+            continue
+
+        v_lo, v_hi = percentile_lohi_nonzero(vol, p_lo, p_hi)
+        start = random.randint(0, Z - window - 1)
+        idxs = list(range(start, start + window + 1))
+
+        real = []
+        for k in idxs:
+            u8 = to_u8(vol[:, :, k], v_lo, v_hi)
+            u8 = resize_u8_square(u8, image_size)
+            t = torch.from_numpy(u8.astype(np.float32) / 255.0)[None, None, ...].to(device)
+            real.append(t)
+
+        z_pos = torch.tensor(
+            [z_min + (z_max - z_min) * ((k / (Z - 1)) if Z > 1 else 0.5) for k in idxs],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # Mixed precision sampling
+        with accelerator.autocast():
+            fake = diffusion_sample_01(diffusion, z_pos=z_pos)
+
+        # For stability in metrics, compute SSIM/L1 in float32
+        fake = fake.float()
+
+        for i in range(window):
+            ra, rb = real[i].float(), real[i + 1].float()
+            fa, fb = fake[i : i + 1], fake[i + 1 : i + 2]
+
+            v = float(ssim_metric(ra, rb).item())
+            sum_real_ssim += v
+            sumsq_real_ssim += v * v
+            cnt_real_ssim += 1
+
+            v = float(ssim_metric(fa, fb).item())
+            sum_fake_ssim += v
+            sumsq_fake_ssim += v * v
+            cnt_fake_ssim += 1
+
+            v = float(torch.mean(torch.abs(ra - rb)).item())
+            sum_real_l1 += v
+            sumsq_real_l1 += v * v
+            cnt_real_l1 += 1
+
+            v = float(torch.mean(torch.abs(fa - fb)).item())
+            sum_fake_l1 += v
+            sumsq_fake_l1 += v * v
+            cnt_fake_l1 += 1
+
+        local_sequences_used += 1
+
+        # Low-volume progress printing (per rank, throttled)
+        if log_every_local > 0 and (idx % log_every_local == 0):
+            print(
+                f"[ISC][rank {accelerator.process_index}] done {idx}/{len(local_chosen)} "
+                f"(used={local_sequences_used}, skipped={local_skipped})",
+                flush=True,
+            )
+
+    # Reduce once at the end (safe collectives)
+    stats = torch.tensor(
+        [
+            sum_real_ssim, sumsq_real_ssim, float(cnt_real_ssim),
+            sum_fake_ssim, sumsq_fake_ssim, float(cnt_fake_ssim),
+            sum_real_l1,   sumsq_real_l1,   float(cnt_real_l1),
+            sum_fake_l1,   sumsq_fake_l1,   float(cnt_fake_l1),
+            float(local_sequences_used), float(local_skipped),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    stats = accelerator.reduce(stats, reduction="sum")
+    stats_cpu = stats.detach().cpu().numpy().tolist()
+
+    def mean_std(sumv: float, sumsqv: float, cnt: float) -> Tuple[float, float]:
+        if cnt <= 0:
+            return float("nan"), float("nan")
+        m = sumv / cnt
+        var = (sumsqv / cnt) - (m * m)
+        var = max(0.0, var)
+        return float(m), float(np.sqrt(var))
+
+    (
+        sr, ssr, cr,
+        sf, ssf, cf,
+        slr, sslr, clr,
+        slf, sslf, clf,
+        seq_used, seq_skipped,
+    ) = stats_cpu
+
+    real_ssim_mean, real_ssim_std = mean_std(sr, ssr, cr)
+    fake_ssim_mean, fake_ssim_std = mean_std(sf, ssf, cf)
+    real_l1_mean, real_l1_std     = mean_std(slr, sslr, clr)
+    fake_l1_mean, fake_l1_std     = mean_std(slf, sslf, clf)
+
+    out: Dict[str, float] = {
+        "real_adj_ssim_mean": real_ssim_mean,
+        "real_adj_ssim_std": real_ssim_std,
+        "fake_adj_ssim_mean": fake_ssim_mean,
+        "fake_adj_ssim_std": fake_ssim_std,
+        "real_adj_l1_mean": real_l1_mean,
+        "real_adj_l1_std": real_l1_std,
+        "fake_adj_l1_mean": fake_l1_mean,
+        "fake_adj_l1_std": fake_l1_std,
+        "num_sequences_used": int(seq_used),
+        "num_sequences_skipped": int(seq_skipped),
+        "window": int(window),
+    }
+    return out
+
+
+# ----------------------------
+# Debug
+# ----------------------------
+@torch.inference_mode()
+def run_debug(
+    accelerator: Accelerator,
+    diffusion: torch.nn.Module,
+    subject_dirs: List[str],
+    modality: str,
+    out_dir: str,
+    device: torch.device,
+    image_size: int,
+    p_lo: float,
+    p_hi: float,
+    z_min: float,
+    z_max: float,
+    smoke_n: int,
+    smoke_folder_metrics: bool,
+) -> None:
+    dbg = os.path.join(out_dir, "debug")
+    os.makedirs(dbg, exist_ok=True)
+
+    sdir = random.choice(subject_dirs)
+    fpath = find_modality_file(sdir, modality)
+    vol = load_nifti(fpath)
+    _, _, Z = vol.shape
+    v_lo, v_hi = percentile_lohi_nonzero(vol, p_lo, p_hi)
+
+    print("\n[DEBUG] Data")
+    print(f"  subject: {sdir}")
+    print(f"  modality file: {fpath}")
+    print(f"  vol shape: {vol.shape}")
+    print(f"  per-volume p{p_lo}/p{p_hi}: lo={v_lo:.4f}, hi={v_hi:.4f}")
+    print(f"  image_size: {image_size}")
+    print(f"  z_min/z_max: {z_min} / {z_max}")
+
+    idxs = sorted(set([0, Z // 4, Z // 2, (3 * Z) // 4, Z - 1]))
+    real_paths, fake_paths = [], []
+
+    z_list = []
+    for k in idxs:
+        frac = (k / (Z - 1)) if Z > 1 else 0.5
+        z_list.append(z_min + (z_max - z_min) * frac)
+    z_pos = torch.tensor(z_list, dtype=torch.float32, device=device)
+
+    for k, z in zip(idxs, z_list):
+        u8 = to_u8(vol[:, :, k], v_lo, v_hi)
+        u8 = resize_u8_square(u8, image_size)
+        p = os.path.join(dbg, f"real_idx{k:03d}_z{z:.3f}.png")
+        save_gray_as_rgb_png(u8, p)
+        real_paths.append(p)
+
+    with accelerator.autocast():
+        fake = diffusion_sample_01(diffusion, z_pos=z_pos)
+
+    print("\n[DEBUG] Sample output")
+    print(f"  z_pos: {z_list}")
+    print(
+        f"  fake: shape={tuple(fake.shape)}, min={fake.min().item():.4f}, "
+        f"max={fake.max().item():.4f}, mean={fake.mean().item():.4f}"
+    )
+
+    for k, z, img in zip(idxs, z_list, fake):
+        u8 = (img[0].detach().cpu().numpy() * 255.0).round().astype(np.uint8)
+        p = os.path.join(dbg, f"fake_idx{k:03d}_z{z:.3f}.png")
+        save_gray_as_rgb_png(u8, p)
+        fake_paths.append(p)
+
+    make_grid(real_paths, nrow=len(real_paths), out_path=os.path.join(dbg, "grid_real.png"))
+    make_grid(fake_paths, nrow=len(fake_paths), out_path=os.path.join(dbg, "grid_fake.png"))
+
+    print(f"\n[DEBUG] Wrote: {os.path.join(dbg, 'grid_real.png')}")
+    print(f"[DEBUG] Wrote: {os.path.join(dbg, 'grid_fake.png')}")
+
+    if smoke_folder_metrics:
+        real_dir = os.path.join(dbg, "smoke_real")
+        fake_dir = os.path.join(dbg, "smoke_fake")
+        os.makedirs(real_dir, exist_ok=True)
+        os.makedirs(fake_dir, exist_ok=True)
+
+        print(f"\n[DEBUG] Smoke test: building tiny real/fake folders (N={smoke_n})")
+        for i in range(smoke_n):
+            s = random.choice(subject_dirs)
+            v = load_nifti(find_modality_file(s, modality))
+            _, _, zz = v.shape
+            k = random.randint(0, zz - 1)
+            lo, hi = percentile_lohi_nonzero(v[:, :, k], p_lo, p_hi)
+            u8 = to_u8(v[:, :, k], lo, hi)
+            u8 = resize_u8_square(u8, image_size)
+            save_gray_as_rgb_png(u8, os.path.join(real_dir, f"r_{i:04d}.png"))
+
+            frac = (k / (zz - 1)) if zz > 1 else 0.5
+            z = z_min + (z_max - z_min) * frac
+            with accelerator.autocast():
+                img = diffusion_sample_01(diffusion, z_pos=torch.tensor([z], device=device))[0, 0]
+            u8f = (img.detach().cpu().numpy() * 255.0).round().astype(np.uint8)
+            save_gray_as_rgb_png(u8f, os.path.join(fake_dir, f"f_{i:04d}.png"))
+
+        m = torch_fidelity_folder_metrics(
+            real_dir,
+            fake_dir,
+            use_cuda=(device.type == "cuda"),
+            kid_subset_size=min(64, smoke_n),
+            kid_subsets=10,
+            num_workers=2,
+            batch_size=16,
+        )
+
+        print("\n[DEBUG] Smoke folder metrics ran successfully. (Values not meaningful at tiny N)")
+        print(json.dumps(m, indent=2))
+
+
+# ----------------------------
+# Main
+# ----------------------------
+def main() -> None:
+    if MODALITY not in {"t1", "t1ce", "t1c", "t2", "flair"}:
+        raise ValueError(f"MODALITY must be one of t1,t1ce,t1c,t2,flair (got {MODALITY})")
+
+    pg = InitProcessGroupKwargs(timeout=timedelta(hours=24))
+    accelerator = Accelerator(
+        cpu=(DEVICE == "cpu"),
+        mixed_precision=MIXED_PRECISION,
+        kwargs_handlers=[pg],
+    )
+    device = accelerator.device
+
+    if accelerator.device.type == "cuda":
+        torch.cuda.set_device(accelerator.device)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    set_seed(SEED, device_specific=True)
+
+    if accelerator.is_main_process:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        print(
+            f"Accelerate: num_processes={accelerator.num_processes}, "
+            f"process_index={accelerator.process_index}, device={device}, "
+            f"mixed_precision={MIXED_PRECISION}",
+            flush=True,
+        )
+    accelerator.wait_for_everyone()
+
+    subject_dirs = find_subject_dirs(BRATS_ROOT)
+
+    diffusion = build_diffusion(
+        image_size=IMAGE_SIZE,
+        timesteps=TIMESTEPS,
+        device=device,
+        img_channels=IMG_CHANNELS,
+        base_channels=BASE_CHANNELS,
+        channel_mults=CHANNEL_MULTS,
+        time_emb_dim=TIME_EMB_DIM,
+    ).to(device)
+    diffusion.eval()
+
+    load_checkpoint_like_yours(diffusion, CHECKPOINT, device=device)
+
+    if DEBUG and accelerator.is_main_process:
+        run_debug(
+            accelerator=accelerator,
+            diffusion=diffusion,
+            subject_dirs=subject_dirs,
+            modality=MODALITY,
+            out_dir=OUT_DIR,
+            device=device,
+            image_size=IMAGE_SIZE,
+            p_lo=P_LO,
+            p_hi=P_HI,
+            z_min=Z_MIN,
+            z_max=Z_MAX,
+            smoke_n=SMOKE_N,
+            smoke_folder_metrics=SMOKE_FOLDER_METRICS,
+        )
+    accelerator.wait_for_everyone()
+    if DEBUG_ONLY and DEBUG:
+        return
+
+    num_images = min(NUM_IMAGES, DEBUG_CAP_NUM_IMAGES) if DEBUG else NUM_IMAGES
+
+    real_dir = os.path.join(OUT_DIR, "real_png")
+    fake_dir = os.path.join(OUT_DIR, "fake_png")
+    if accelerator.is_main_process:
+        os.makedirs(real_dir, exist_ok=True)
+        os.makedirs(fake_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    # Shard indices across processes:
+    local_indices = list(range(accelerator.process_index, num_images, accelerator.num_processes))
+
+    log_main(accelerator, f"\n[1/5] Creating REAL folder (N={num_images}) -> {real_dir}")
+
+    local_meta: List[Tuple[int, int, int]] = []
+
+    for i in local_indices:
+        sdir = random.choice(subject_dirs)
+        vol = load_nifti(find_modality_file(sdir, MODALITY))
+        _, _, Z = vol.shape
+        k = random.randint(0, Z - 1)
+
+        lo, hi = percentile_lohi_nonzero(vol[:, :, k], P_LO, P_HI)
+        u8 = to_u8(vol[:, :, k], lo, hi)
+        u8 = resize_u8_square(u8, IMAGE_SIZE)
+
+        save_gray_as_rgb_png(u8, os.path.join(real_dir, f"real_{i:06d}.png"))
+        local_meta.append((i, k, Z))
+    accelerator.wait_for_everyone()
+
+    log_main(accelerator, f"\n[2/5] Creating FAKE folder (N={num_images}) -> {fake_dir}")
+
+    local_meta.sort(key=lambda t: t[0])
+
+    for batch in chunked(local_meta, BATCH_SIZE):
+        z_list = []
+        out_indices = []
+        for (gi, k, Z) in batch:
+            frac = (k / (Z - 1)) if Z > 1 else 0.5
+            z_list.append(Z_MIN + (Z_MAX - Z_MIN) * frac)
+            out_indices.append(gi)
+
+        z_pos = torch.tensor(z_list, dtype=torch.float32, device=device)
+
+        with accelerator.autocast():
+            imgs = diffusion_sample_01(diffusion, z_pos=z_pos)
+
+        imgs_u8 = (imgs[:, 0].detach().cpu().numpy() * 255.0).round().astype(np.uint8)
+        for j, gi in enumerate(out_indices):
+            save_gray_as_rgb_png(imgs_u8[j], os.path.join(fake_dir, f"fake_{gi:06d}.png"))
+
+    accelerator.wait_for_everyone()
+
+    # Step 3 + 4 only on main
+    tf = None
+    div = None
+    if accelerator.is_main_process:
+        print("\n[3/5] Computing FID/KID/PRC (torch-fidelity)...", flush=True)
+        tf = torch_fidelity_folder_metrics(real_dir, fake_dir, use_cuda=(device.type == "cuda"))
+
+        print("\n[4/5] Computing diversity (MS-SSIM + LPIPS) on fake set...", flush=True)
+        div = diversity_metrics(fake_dir, device=device, num_pairs=DIV_PAIRS)
+
+        config = {
+            "BRATS_ROOT": str(BRATS_ROOT),
+            "MODALITY": MODALITY,
+            "CHECKPOINT": CHECKPOINT,
+            "OUT_DIR": OUT_DIR,
+            "IMAGE_SIZE": IMAGE_SIZE,
+            "TIMESTEPS": TIMESTEPS,
+            "IMG_CHANNELS": IMG_CHANNELS,
+            "BASE_CHANNELS": BASE_CHANNELS,
+            "CHANNEL_MULTS": list(CHANNEL_MULTS),
+            "TIME_EMB_DIM": TIME_EMB_DIM,
+            "Z_MIN": Z_MIN,
+            "Z_MAX": Z_MAX,
+            "NUM_IMAGES": NUM_IMAGES,
+            "BATCH_SIZE": BATCH_SIZE,
+            "P_LO": P_LO,
+            "P_HI": P_HI,
+            "DIV_PAIRS": DIV_PAIRS,
+            "ISC_NUM_SEQUENCES": ISC_NUM_SEQUENCES,
+            "ISC_WINDOW": ISC_WINDOW,
+            "SEED": SEED,
+            "DEVICE": DEVICE,
+            "MIXED_PRECISION": MIXED_PRECISION,
+            "DEBUG": DEBUG,
+            "DEBUG_ONLY": DEBUG_ONLY,
+            "SMOKE_FOLDER_METRICS": SMOKE_FOLDER_METRICS,
+            "SMOKE_N": SMOKE_N,
+            "DEBUG_CAP_NUM_IMAGES": DEBUG_CAP_NUM_IMAGES,
+        }
+
+        results_step4 = {
+            "config": config,
+            "torch_fidelity": tf,
+            "diversity": div,
+            "inter_slice_consistency": None,
+        }
+
+        out_json_step4 = os.path.join(OUT_DIR, "metrics_step4.json")
+        save_json(out_json_step4, results_step4)
+        print(f"\nSaved step-4 metrics to: {out_json_step4}", flush=True)
+
+    accelerator.wait_for_everyone()
+
+    # Step 5 on ALL processes (distributed)
+    log_main(accelerator, "\n[5/5] Computing inter-slice consistency (distributed across GPUs)...")
+
+    isc = inter_slice_consistency_distributed(
+        accelerator=accelerator,
+        diffusion=diffusion,
+        subject_dirs=subject_dirs,
+        modality=MODALITY,
+        device=device,
+        image_size=IMAGE_SIZE,
+        num_sequences=ISC_NUM_SEQUENCES,
+        window=ISC_WINDOW,
+        p_lo=P_LO,
+        p_hi=P_HI,
+        z_min=Z_MIN,
+        z_max=Z_MAX,
+        log_every_local=ISC_LOG_EVERY_LOCAL,
+    )
+
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        # tf/div exist only on main, so reuse them here
+        # (they were computed above and still in scope)
+        config = {
+            "BRATS_ROOT": str(BRATS_ROOT),
+            "MODALITY": MODALITY,
+            "CHECKPOINT": CHECKPOINT,
+            "OUT_DIR": OUT_DIR,
+            "IMAGE_SIZE": IMAGE_SIZE,
+            "TIMESTEPS": TIMESTEPS,
+            "IMG_CHANNELS": IMG_CHANNELS,
+            "BASE_CHANNELS": BASE_CHANNELS,
+            "CHANNEL_MULTS": list(CHANNEL_MULTS),
+            "TIME_EMB_DIM": TIME_EMB_DIM,
+            "Z_MIN": Z_MIN,
+            "Z_MAX": Z_MAX,
+            "NUM_IMAGES": NUM_IMAGES,
+            "BATCH_SIZE": BATCH_SIZE,
+            "P_LO": P_LO,
+            "P_HI": P_HI,
+            "DIV_PAIRS": DIV_PAIRS,
+            "ISC_NUM_SEQUENCES": ISC_NUM_SEQUENCES,
+            "ISC_WINDOW": ISC_WINDOW,
+            "SEED": SEED,
+            "DEVICE": DEVICE,
+            "MIXED_PRECISION": MIXED_PRECISION,
+            "DEBUG": DEBUG,
+            "DEBUG_ONLY": DEBUG_ONLY,
+            "SMOKE_FOLDER_METRICS": SMOKE_FOLDER_METRICS,
+            "SMOKE_N": SMOKE_N,
+            "DEBUG_CAP_NUM_IMAGES": DEBUG_CAP_NUM_IMAGES,
+        }
+
+        results_final = {
+            "config": config,
+            "torch_fidelity": tf,
+            "diversity": div,
+            "inter_slice_consistency": isc,
+        }
+
+        out_json = os.path.join(OUT_DIR, "metrics.json")
+        save_json(out_json, results_final)
+
+        print("\n=== DONE ===", flush=True)
+        print(json.dumps(results_final, indent=2), flush=True)
+        print(f"\nSaved final metrics to: {out_json}", flush=True)
+
+    accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

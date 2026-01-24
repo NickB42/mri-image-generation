@@ -1,0 +1,66 @@
+{
+  "config": {
+    "BRATS_ROOT": "/hkfs/home/haicore/scc/yb3349/mri/datasets/test",
+    "MODALITY": "flair",
+    "CHECKPOINT": "/hkfs/home/haicore/scc/yb3349/mri/model_scripts/slice_cond_2d_ddpm/models/1591624/2d_central_ddpm_flair_best.pt",
+    "OUT_DIR": "./eval_out/slice/1599603",
+    "IMAGE_SIZE": 128,
+    "TIMESTEPS": 1000,
+    "IMG_CHANNELS": 1,
+    "BASE_CHANNELS": 64,
+    "CHANNEL_MULTS": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "TIME_EMB_DIM": 256,
+    "Z_MIN": 0.0,
+    "Z_MAX": 1.0,
+    "NUM_IMAGES": 2000,
+    "BATCH_SIZE": 32,
+    "P_LO": 0.5,
+    "P_HI": 99.5,
+    "DIV_PAIRS": 1000,
+    "ISC_NUM_SEQUENCES": 50,
+    "ISC_WINDOW": 16,
+    "SEED": 123,
+    "DEVICE": "auto",
+    "MIXED_PRECISION": "fp16",
+    "DEBUG": false,
+    "DEBUG_ONLY": false,
+    "SMOKE_FOLDER_METRICS": true,
+    "SMOKE_N": 64,
+    "DEBUG_CAP_NUM_IMAGES": 256
+  },
+  "torch_fidelity": {
+    "frechet_inception_distance": 170.04963432945755,
+    "kernel_inception_distance_mean": 0.16127401113510131,
+    "kernel_inception_distance_std": 0.0019035038062519545,
+    "kid_subset_size_used": 1000,
+    "kid_enabled": true,
+    "n_real": 2000,
+    "n_fake": 2000
+  },
+  "diversity": {
+    "ms_ssim_pair_mean": 0.7154090560674667,
+    "ms_ssim_pair_std": 0.09225006999497044,
+    "lpips_pair_mean": 0.2596931583955884,
+    "lpips_pair_std": 0.0878738350249989,
+    "diversity_num_loaded": 1760,
+    "diversity_num_pairs": 1000
+  },
+  "inter_slice_consistency": {
+    "real_adj_ssim_mean": 0.9768047042191028,
+    "real_adj_ssim_std": 0.01581333494472553,
+    "fake_adj_ssim_mean": 0.8168121910840273,
+    "fake_adj_ssim_std": 0.07641311877144767,
+    "real_adj_l1_mean": 0.005423914352938937,
+    "real_adj_l1_std": 0.00372814229551224,
+    "fake_adj_l1_mean": 0.019809649784874636,
+    "fake_adj_l1_std": 0.008374881488803125,
+    "num_sequences_used": 50,
+    "num_sequences_skipped": 0,
+    "window": 16
+  }
+}

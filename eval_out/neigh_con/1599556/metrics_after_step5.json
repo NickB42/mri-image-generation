@@ -1,0 +1,139 @@
+{
+  "config": {
+    "BRATS_ROOT": "/hkfs/home/haicore/scc/yb3349/mri/datasets/test",
+    "CHECKPOINT": "/hkfs/home/haicore/scc/yb3349/mri/model_scripts/ddpm_25d_all_modalities/models/1591706/25d_ddpm_all_modalities_best.pt",
+    "OUT_DIR": "./eval_out/neigh_con/1599556",
+    "IMAGE_SIZE": 128,
+    "TIMESTEPS": 1000,
+    "CENTER_MODALITIES": 4,
+    "SLICE_RADIUS": 2,
+    "CONTEXT_SLICES": 4,
+    "IN_CHANNELS": 20,
+    "OUT_CHANNELS": 4,
+    "BASE_CHANNELS": 64,
+    "CHANNEL_MULTS": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "TIME_EMB_DIM": 256,
+    "NUM_IMAGES": 2000,
+    "BATCH_SIZE": 32,
+    "DIV_PAIRS": 1000,
+    "DIVERSITY_RESIZE_TO": 256,
+    "ISC_NUM_SEQUENCES": 50,
+    "ISC_WINDOW": 16,
+    "ISC_SAMPLE_BATCH": 32,
+    "DO_COND_RECON": true,
+    "COND_RECON_SAMPLES": 256,
+    "COND_RECON_BATCH": 32,
+    "SEED": 123,
+    "DEVICE": "auto",
+    "MIXED_PRECISION": "fp16",
+    "DEBUG": false,
+    "DEBUG_ONLY": false,
+    "SMOKE_FOLDER_METRICS": true,
+    "SMOKE_N": 64,
+    "DEBUG_CAP_NUM_IMAGES": 256
+  },
+  "torch_fidelity_by_modality": {
+    "t1": {
+      "frechet_inception_distance": 45.36578730066424,
+      "kernel_inception_distance_mean": 0.034711632728576663,
+      "kernel_inception_distance_std": 0.0007915732641757672,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 2000,
+      "n_fake": 2000
+    },
+    "t1ce": {
+      "frechet_inception_distance": 43.250756158102604,
+      "kernel_inception_distance_mean": 0.034019200801849364,
+      "kernel_inception_distance_std": 0.0008550622087029713,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 2000,
+      "n_fake": 2000
+    },
+    "t2": {
+      "frechet_inception_distance": 32.50129298986462,
+      "kernel_inception_distance_mean": 0.022744905948638917,
+      "kernel_inception_distance_std": 0.0006616555125223779,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 2000,
+      "n_fake": 2000
+    },
+    "flair": {
+      "frechet_inception_distance": 36.47335909444678,
+      "kernel_inception_distance_mean": 0.029266307353973387,
+      "kernel_inception_distance_std": 0.0007571919579389614,
+      "kid_subset_size_used": 1000,
+      "kid_enabled": true,
+      "n_real": 2000,
+      "n_fake": 2000
+    }
+  },
+  "torch_fidelity_macro": {
+    "fid_macro": 39.39779888576956,
+    "kid_mean_macro": 0.03018551170825958,
+    "kid_std_macro": 0.0007663707358350194,
+    "precision_macro": NaN,
+    "recall_macro": NaN
+  },
+  "diversity_by_modality": {
+    "t1": {
+      "ms_ssim_pair_mean": 0.6084451233744621,
+      "ms_ssim_pair_std": 0.0898814183655974,
+      "lpips_pair_mean": 0.26643632017076013,
+      "lpips_pair_std": 0.07967743575847815,
+      "diversity_num_loaded": 1760,
+      "diversity_num_pairs": 1000
+    },
+    "t1ce": {
+      "ms_ssim_pair_mean": 0.645413495272398,
+      "ms_ssim_pair_std": 0.08258970189549622,
+      "lpips_pair_mean": 0.2662940747216344,
+      "lpips_pair_std": 0.06940992565648547,
+      "diversity_num_loaded": 1760,
+      "diversity_num_pairs": 1000
+    },
+    "t2": {
+      "ms_ssim_pair_mean": 0.6344897103905678,
+      "ms_ssim_pair_std": 0.08058519355119619,
+      "lpips_pair_mean": 0.2543856099843979,
+      "lpips_pair_std": 0.0695536786542196,
+      "diversity_num_loaded": 1760,
+      "diversity_num_pairs": 1000
+    },
+    "flair": {
+      "ms_ssim_pair_mean": 0.6428091351091861,
+      "ms_ssim_pair_std": 0.07931492537942812,
+      "lpips_pair_mean": 0.26384274931252005,
+      "lpips_pair_std": 0.06999667021735917,
+      "diversity_num_loaded": 1760,
+      "diversity_num_pairs": 1000
+    }
+  },
+  "diversity_macro": {
+    "ms_ssim_pair_mean_macro": 0.6327893660366535,
+    "lpips_pair_mean_macro": 0.2627396885473281
+  },
+  "inter_slice_consistency": {
+    "real_adj_ssim_mean": 0.9661083097755909,
+    "real_adj_ssim_std": 0.01380387255628905,
+    "fake_adj_ssim_mean": 0.9552063614875078,
+    "fake_adj_ssim_std": 0.013785627472359435,
+    "real_adj_l1_mean": 0.004910580125288107,
+    "real_adj_l1_std": 0.0016862577879388527,
+    "fake_adj_l1_mean": 0.01240886864659842,
+    "fake_adj_l1_std": 0.004144162913711757,
+    "num_sequences_target": 50,
+    "num_sequences_used": 50,
+    "num_adj_pairs_used": 800,
+    "window": 16,
+    "slice_radius": 2,
+    "sample_batch": 32
+  }
+}
