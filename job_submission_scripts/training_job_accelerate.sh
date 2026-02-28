@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --partition=normal
-#SBATCH --time=48:00:00
-#SBATCH --gres=gpu:4g.20gb:1
+#SBATCH --time=28:00:00
+#SBATCH --gres=gpu:4g.20gb:4
 #SBATCH --job-name=ddpm_25d_seq_train
 #SBATCH --output=/dev/null
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -75,15 +75,15 @@ echo "NUM_GPUS: $NUM_GPUS"
 echo
 
 ## GPU MONITOR: start periodic logging in background
-GPU_LOG="${LOG_DIR}/gpu_usage_${SLURM_JOB_ID}.csv"
-echo "Logging GPU usage to: $GPU_LOG"
-echo "timestamp,util.gpu,util.mem,mem.used,mem.total" > "$GPU_LOG"
+# GPU_LOG="${LOG_DIR}/gpu_usage_${SLURM_JOB_ID}.csv"
+# echo "Logging GPU usage to: $GPU_LOG"
+# echo "timestamp,util.gpu,util.mem,mem.used,mem.total" > "$GPU_LOG"
 
-nvidia-smi \
-  --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total \
-  --format=csv,noheader,nounits \
-  -l 30 >> "$GPU_LOG" &
-GPU_MONITOR_PID=$!
+# nvidia-smi \
+#   --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total \
+#   --format=csv,noheader,nounits \
+#   -l 2 >> "$GPU_LOG" &
+# GPU_MONITOR_PID=$!
 
 
 # -----------------------------
@@ -168,6 +168,6 @@ fi
 TRAIN_EXIT_CODE=$?
 
 # Cleanup GPU monitor
-kill "$GPU_MONITOR_PID" 2>/dev/null || true
+# kill "$GPU_MONITOR_PID" 2>/dev/null || true
 
 exit "$TRAIN_EXIT_CODE"

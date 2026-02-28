@@ -8,7 +8,7 @@ import random
 import numpy as np
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from accelerate import Accelerator
 
 import mlflow
@@ -17,6 +17,7 @@ import mlflow.pytorch
 from .dataset import BraTSSliceDataset
 from .unet import UNet
 from .diffusion import GaussianDiffusion
+from .ema import EMA
 from ..helpers.perun_utils import run_with_perun
 
 # -------------------------------------------------------------------
@@ -27,20 +28,17 @@ RUN_IDENTIFIER = os.environ.get("SLURM_JOB_ID") or str(uuid.uuid4())
 
 IMAGE_SIZE = 128
 TIMESTEPS = 1000
-PATIENCE = 3
+PATIENCE = 15
 LEARNING_RATE = 2e-4
 MIN_DELTA = 1e-4
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_EPOCHS = 60
 
 CENTER_MODALITIES = 4
 SLICE_RADIUS = 2
 
-NUM_WORKERS = 4
-DEBUG_FAST = True
-
-# Make split deterministic across processes
-SPLIT_SEED = 42
+NUM_WORKERS = 8
+DEBUG_FAST = False
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PROJECT_ROOT / EXPERIMENT_NAME
@@ -105,10 +103,29 @@ if DEBUG_FAST:
     train_dataset = Subset(train_dataset, list(range(min(64, len(train_dataset)))))
     val_dataset   = Subset(val_dataset,   list(range(min(64, len(val_dataset)))))
 
+# D2) Oversample end-ish slices via WeightedRandomSampler
+def z_weight(z_pos: float) -> float:
+    """Emphasise ends of usable range (0.1-0.9): give 2x weight to 0.1-0.25 and 0.75-0.9."""
+    if z_pos < 0.25 or z_pos > 0.75:
+        return 2.0
+    return 1.0
+
+# Build per-sample weights (works with raw dataset; Subset handled below)
+_base_train = train_dataset.dataset if isinstance(train_dataset, Subset) else train_dataset
+if isinstance(train_dataset, Subset):
+    _indices = train_dataset.indices
+    weights = [z_weight(float(_base_train.slice_tuples[i][1]) / float(_base_train.slice_tuples[i][2] - 1))
+               for i in _indices]
+else:
+    weights = [z_weight(float(z) / float(D - 1)) for (_, z, D) in _base_train.slice_tuples]
+
+train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
-    shuffle=True,
+    sampler=train_sampler,
+    shuffle=False,          # sampler and shuffle are mutually exclusive
     num_workers=NUM_WORKERS,
     pin_memory=True,
     worker_init_fn=seed_worker,
@@ -150,6 +167,7 @@ diffusion = GaussianDiffusion(
     image_size=IMAGE_SIZE,
     channels=OUT_CHANNELS,
     timesteps=TIMESTEPS,
+    schedule="cosine",
 )
 
 optimizer = torch.optim.Adam(diffusion.model.parameters(), lr=LEARNING_RATE)
@@ -165,6 +183,9 @@ diffusion, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     diffusion, optimizer, train_loader, val_loader, scheduler
 )
 
+# Create EMA *after* accelerator.prepare so the shadow copy lives on GPU
+ema = EMA(accelerator.unwrap_model(diffusion).model, decay=0.9999)
+
 # -------------------------------------------------------------------
 # Training helpers
 # -------------------------------------------------------------------
@@ -173,14 +194,14 @@ def train_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float:
     base_diffusion = accelerator.unwrap_model(diffusion)
     running_loss_sum = 0.0
     count = 0
-    n_steps = 0
 
     start_time = time.time()
 
-    for step, (x_center, x_context, z_pos) in enumerate(train_loader, start=1):
+    for step, (x_center, x_context, z_pos, fg_frac) in enumerate(train_loader, start=1):
         x_center = x_center.to(device, non_blocking=True)
         x_context = x_context.to(device, non_blocking=True)
         z_pos = z_pos.to(device).float()
+        fg_frac = fg_frac.to(device).float()
 
         b = x_center.size(0)
         t = torch.randint(0, base_diffusion.timesteps, (b,), device=device).long()
@@ -188,14 +209,16 @@ def train_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float:
         optimizer.zero_grad(set_to_none=True)
 
         with accelerator.autocast():
-            loss = base_diffusion.p_losses(x_center, t, z_pos, context=x_context)
+            loss = base_diffusion.p_losses(x_center, t, z_pos, fg_frac=fg_frac, context=x_context)
 
         accelerator.backward(loss)
         optimizer.step()
 
+        # B) Update EMA using the unwrapped model (important with Accelerate/DDP)
+        ema.update(base_diffusion.model)
+
         running_loss_sum += float(loss.item()) * b
         count += b
-        n_steps += 1
 
         if IS_MAIN_PROCESS and step % 500 == 0:
             avg_local = running_loss_sum / max(1, count)
@@ -206,18 +229,11 @@ def train_one_epoch(epoch: int, max_steps: Union[int, None] = None) -> float:
 
     elapsed = time.time() - start_time
     avg_loss = reduce_avg_loss(running_loss_sum, count)
-    steps_per_s = n_steps / max(elapsed, 1e-8)
 
     if IS_MAIN_PROCESS:
         accelerator.print(
-            f"Epoch {epoch} | Train loss: {avg_loss:.4f} | "
-            f"steps: {n_steps} | time: {elapsed:.1f}s | {steps_per_s:.2f} steps/s"
+            f"Epoch {epoch} | Train loss: {avg_loss:.4f} | time: {elapsed:.1f}s"
         )
-        run = mlflow.active_run()
-        if run is not None:
-            mlflow.log_metric("train_steps_per_s", steps_per_s, step=epoch)
-            mlflow.log_metric("train_num_steps", n_steps, step=epoch)
-            mlflow.log_metric("train_epoch_time_s", elapsed, step=epoch)
 
     return avg_loss
 
@@ -228,16 +244,17 @@ def validate(epoch: int, max_steps: Union[int, None] = None) -> float:
     running_loss_sum = 0.0
     count = 0
 
-    for step, (x_center, x_context, z_pos) in enumerate(val_loader, start=1):
+    for step, (x_center, x_context, z_pos, fg_frac) in enumerate(val_loader, start=1):
         x_center = x_center.to(device, non_blocking=True)
         x_context = x_context.to(device, non_blocking=True)
         z_pos = z_pos.to(device).float()
+        fg_frac = fg_frac.to(device).float()
 
         b = x_center.size(0)
         t = torch.randint(0, base_diffusion.timesteps, (b,), device=device).long()
 
         with accelerator.autocast():
-            loss = base_diffusion.p_losses(x_center, t, z_pos, context=x_context)
+            loss = base_diffusion.p_losses(x_center, t, z_pos, fg_frac=fg_frac, context=x_context)
 
         running_loss_sum += float(loss.item()) * b
         count += b
@@ -288,8 +305,11 @@ def train() -> float:
                 MODELS_DIR.mkdir(parents=True, exist_ok=True)
                 best_path = MODELS_DIR / "2d_central_ddpm_flair_best.pt"
 
-                # Save diffusion (includes model + diffusion buffers)
-                state = accelerator.get_state_dict(diffusion)
+                # Save diffusion (includes model + diffusion buffers) + EMA weights
+                state = {
+                    "diffusion": accelerator.get_state_dict(diffusion),
+                    "ema_unet": ema.state_dict(),
+                }
                 accelerator.save(state, str(best_path))
 
                 accelerator.print(f"✅ New best val loss: {best_val:.4f}")
@@ -347,8 +367,7 @@ def main() -> None:
                     "modalities": CENTER_MODALITIES,
                     "SLICE_RADIUS": SLICE_RADIUS,
                     "accelerate_num_processes": accelerator.num_processes,
-                    "accelerate_mixed_precision": str(accelerator.mixed_precision),
-                    "split_seed": SPLIT_SEED,
+                    "accelerate_mixed_precision": str(accelerator.mixed_precision), 
                 }
             )
 

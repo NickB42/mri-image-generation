@@ -22,3 +22,7 @@ eval_out/**/real_png/
 slice_cond_2d_ddpm_builtin/
 
 med_ddpm/
+
+sanity_out/
+samples/
+runs/

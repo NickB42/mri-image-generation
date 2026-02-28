@@ -11,10 +11,10 @@ class BraTSSliceDataset(Dataset):
     """
     Multi-modal 2.5D dataset:
     - Uses 4 modalities: t1, t1ce, t2, flair
-    - Uses central ~80% slices, but also needs neighbors (z-1, z+1)
+    - Uses central ~80% slices, but also needs lower slices for context
     - Returns:
         x_center:  (4, H, W)   center slice, all modalities
-        x_context: (8, H, W)   neighbors (z-1, z+1) for all modalities
+        x_context: (4 * slice_radius, H, W) neighboring slices
         z_pos:     scalar in [0, 1]
     """
 
@@ -24,7 +24,6 @@ class BraTSSliceDataset(Dataset):
         self.image_size = image_size
         self.slice_radius = slice_radius
 
-        # We'll anchor on FLAIR files and infer other modalities
         self.flair_suffix = "_flair.nii.gz"
         self.modalities = [
             "_t1.nii.gz",
@@ -49,7 +48,7 @@ class BraTSSliceDataset(Dataset):
             z_start = int(0.1 * D) + self.slice_radius
             z_end   = int(0.9 * D)
             for z in range(z_start, z_end):
-                self.slice_tuples.append((p, z))
+                self.slice_tuples.append((p, z, D))
 
         print(f"Found {len(self.volume_paths)} volumes.")
         print(f"Built {len(self.slice_tuples)} (volume, slice) pairs.")
@@ -106,7 +105,7 @@ class BraTSSliceDataset(Dataset):
         return len(self.slice_tuples)
 
     def __getitem__(self, idx):
-        flair_path, z = self.slice_tuples[idx]
+        flair_path, z, D = self.slice_tuples[idx]
 
         # Load all four modalities for this subject
         vols = []
@@ -115,7 +114,10 @@ class BraTSSliceDataset(Dataset):
             vol = self._load_volume(m_path)
             vols.append(vol)  # each (H, W, D)
 
-        D = vols[0].shape[-1]
+        # Foreground fraction from FLAIR (last modality) at center slice
+        flair_vol = vols[3]  # modalities list ends with _flair
+        flair_slice = flair_vol[:, :, z]
+        fg_frac = np.float32((flair_slice != 0).mean())  # in [0,1]
 
         # Center slice: all modalities at z
         center_slices = []
@@ -136,4 +138,4 @@ class BraTSSliceDataset(Dataset):
         # z normalization (center slice position)
         z_pos = np.float32(z / (D - 1))
 
-        return x_center, x_context, z_pos
+        return x_center, x_context, z_pos, fg_frac

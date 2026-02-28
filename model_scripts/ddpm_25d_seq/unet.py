@@ -57,6 +57,35 @@ class ResidualBlock(nn.Module):
         return h + self.res_conv(x)
 
 
+class AttentionBlock(nn.Module):
+    def __init__(self, channels: int, num_heads: int = 4, groups: int = 8):
+        super().__init__()
+        self.norm = nn.GroupNorm(groups, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.num_heads = num_heads
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        # (B, heads, head_dim, HW)
+        head_dim = C // self.num_heads
+        q = q.view(B, self.num_heads, head_dim, H * W)
+        k = k.view(B, self.num_heads, head_dim, H * W)
+        v = v.view(B, self.num_heads, head_dim, H * W)
+
+        attn = torch.einsum("bhde,bhdf->bhef", q, k) * (head_dim ** -0.5)
+        attn = attn.softmax(dim=-1)
+
+        out = torch.einsum("bhef,bhdf->bhde", attn, v)
+        out = out.reshape(B, C, H, W)
+        out = self.proj(out)
+        return x + out
+
+
 class DownBlock(nn.Module):
     """
     One U-Net down block:
@@ -64,15 +93,17 @@ class DownBlock(nn.Module):
       then downsample to half spatial size
     Returns (x_down, skip)
     """
-    def __init__(self, in_ch: int, out_ch: int, t_dim: int):
+    def __init__(self, in_ch: int, out_ch: int, t_dim: int, use_attn: bool = False):
         super().__init__()
         self.res1 = ResidualBlock(in_ch, out_ch, t_dim)
         self.res2 = ResidualBlock(out_ch, out_ch, t_dim)
+        self.attn = AttentionBlock(out_ch) if use_attn else nn.Identity()
         self.down = nn.Conv2d(out_ch, out_ch, 4, stride=2, padding=1)
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor):
         x = self.res1(x, t_emb)
         x = self.res2(x, t_emb)
+        x = self.attn(x)
         skip = x
         x = self.down(x)
         return x, skip
@@ -85,13 +116,14 @@ class UpBlock(nn.Module):
       concat with skip (skip_ch),
       then two residual blocks -> out_ch
     """
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, t_dim: int):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, t_dim: int, use_attn: bool = False):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1)
         self.res1 = ResidualBlock(out_ch + skip_ch, out_ch, t_dim)
         self.res2 = ResidualBlock(out_ch, out_ch, t_dim)
+        self.attn = AttentionBlock(out_ch) if use_attn else nn.Identity()
 
-        print(f"UpBlock: in_ch={in_ch}, skip_ch={skip_ch}, out_ch={out_ch}")
+        print(f"UpBlock: in_ch={in_ch}, skip_ch={skip_ch}, out_ch={out_ch}, use_attn={use_attn}")
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
@@ -103,6 +135,7 @@ class UpBlock(nn.Module):
 
         x = self.res1(x, t_emb)
         x = self.res2(x, t_emb)
+        x = self.attn(x)
         return x
 
 
@@ -140,6 +173,13 @@ class UNet(nn.Module):
             nn.Linear(time_emb_dim * 4, time_emb_dim),
         )
 
+        # ----- foreground fraction embedding -----
+        self.fg_mlp = nn.Sequential(
+            nn.Linear(1, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim),
+        )
+
         # channel sizes at each resolution
         self.chs = [base_channels * m for m in channel_mults]
 
@@ -148,12 +188,14 @@ class UNet(nn.Module):
 
         # ----- down path -----
         downs = []
-        for in_ch, out_ch in zip(self.chs[:-1], self.chs[1:]):
-            downs.append(DownBlock(in_ch, out_ch, time_emb_dim))
+        for i, (in_ch, out_ch) in enumerate(zip(self.chs[:-1], self.chs[1:])):
+            use_attn = (out_ch >= 256)  # attention at deeper (higher-channel) levels
+            downs.append(DownBlock(in_ch, out_ch, time_emb_dim, use_attn=use_attn))
         self.downs = nn.ModuleList(downs)
 
         # bottleneck
         self.mid_block1 = ResidualBlock(self.chs[-1], self.chs[-1], time_emb_dim)
+        self.mid_attn = AttentionBlock(self.chs[-1])
         self.mid_block2 = ResidualBlock(self.chs[-1], self.chs[-1], time_emb_dim)
 
         # ----- up path -----
@@ -163,7 +205,8 @@ class UNet(nn.Module):
         in_ch = self.chs[-1]
         # reverse to go from coarsest to finest
         for skip_ch, out_ch in zip(reversed(skip_chs), reversed(self.chs[:-1])):
-            ups.append(UpBlock(in_ch, skip_ch, out_ch, time_emb_dim))
+            use_attn = (out_ch >= 256)
+            ups.append(UpBlock(in_ch, skip_ch, out_ch, time_emb_dim, use_attn=use_attn))
             in_ch = out_ch
         self.ups = nn.ModuleList(ups)
 
@@ -176,10 +219,12 @@ class UNet(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         z_pos: torch.Tensor,
+        fg_frac: Union[torch.Tensor, None] = None,
         context: Union[torch.Tensor, None] = None,
     ) -> torch.Tensor:
         """
         x:       (B, C_target, H, W)  - noisy center-slice modalities
+        fg_frac: (B,) or None         - foreground fraction of center slice
         context: (B, C_context, H, W) - clean neighboring slices (optional)
         """
         t = t.to(x.device)
@@ -194,6 +239,12 @@ class UNet(nn.Module):
         # combine
         cond_emb = t_emb + z_emb
 
+        # foreground fraction embedding
+        if fg_frac is not None:
+            fg_frac = fg_frac.to(x.device).float()
+            fg_emb = self.fg_mlp(fg_frac.unsqueeze(-1))
+            cond_emb = cond_emb + fg_emb
+
         # concatenate context channels if provided
         if context is not None:
             x = torch.cat([x, context], dim=1)
@@ -206,6 +257,7 @@ class UNet(nn.Module):
             skips.append(skip)
 
         x = self.mid_block1(x, cond_emb)
+        x = self.mid_attn(x)
         x = self.mid_block2(x, cond_emb)
 
         for up in self.ups:
