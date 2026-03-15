@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=normal
-#SBATCH --time=40:00:00
-#SBATCH --gres=gpu:full:3
+#SBATCH --time=72:00:00
+#SBATCH --gres=gpu:full:4
 #SBATCH --job-name=ddpm_25d_mm_train
 #SBATCH --output=/dev/null
 #SBATCH --cpus-per-task=8

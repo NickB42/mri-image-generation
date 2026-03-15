@@ -103,32 +103,17 @@ class GaussianDiffusion(nn.Module):
         )
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    # def p_losses(self, x_start, t, z_pos, context=None, noise=None):
-    #     """
-    #     Loss for a given batch.
-    #     x_start: (B, C_target, H, W) in [-1, 1]  - center slice, 4 modalities
-    #     context: (B, C_context, H, W)            - neighbors (e.g. 8 channels)
-    #     """
-    #     if noise is None:
-    #         noise = torch.randn_like(x_start)
-
-    #     x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-
-    #     predicted_noise = self.model(x_noisy, t, z_pos, context=context)
-
-    #     return F.mse_loss(predicted_noise, noise)
-
     def p_losses(self, x_start, t, z_pos, fg_frac=None, context=None, noise=None):
         if noise is None:
             noise = torch.randn_like(x_start)
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        # --- NEW: make context robust ---
+        # --- make context robust ---
         if context is not None:
             B = context.shape[0]
 
-            # (1) context dropout (like "conditioning dropout" used in classifier-free setups)
+            # (1) context dropout (like "conditioning dropout")
             p_drop = 0.1
             if torch.rand((), device=context.device) < p_drop:
                 context = torch.zeros_like(context)

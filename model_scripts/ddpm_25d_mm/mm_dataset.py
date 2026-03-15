@@ -19,7 +19,7 @@ from torch.utils.data import Dataset
 from pathlib import Path
 
 NUM_SLICES = 155
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # -> /home/.../mri
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MEMMAP_DIR = PROJECT_ROOT / "datasets" / "memmap"
 
 

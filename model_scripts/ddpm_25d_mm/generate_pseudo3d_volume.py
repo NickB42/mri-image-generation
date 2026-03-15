@@ -32,7 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]  # -> /home/.../mri
 DATASET_MEMMAP = PROJECT_ROOT / "datasets" / "memmap" / "train_flair_256.npy"
 # Update this to your actual checkpoint path after training:
 CHECKPOINT_PATH = (
-    Path(__file__).resolve().parent / "models" / "1615499" / "ddpm_25d_mm_best.pt"
+    Path(__file__).resolve().parent / "models" / "1618558" / "ddpm_25d_mm_best.pt"
 )
 
 OUT_DIR = Path(__file__).resolve().parent / "pseudo3d_mm_out"

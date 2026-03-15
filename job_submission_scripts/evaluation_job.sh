@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=normal
 #SBATCH --time=24:00:00
-#SBATCH --gres=gpu:full:4
+#SBATCH --gres=gpu:full:2
 #SBATCH --job-name=ddpm_eval
 #SBATCH --output=/dev/null
 #SBATCH --cpus-per-task=8
